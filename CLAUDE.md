@@ -38,10 +38,10 @@ uses: <org>/build-agent/.github/workflows/capacitor.yml@main
 
 Secrets/variables must be set on the **caller repo**, not this one. Use `push-secrets.sh` to push them.
 
-### Naming conventions in `.secrets.env`
-- `VAR_` prefix → pushed as **GitHub Variable** (visible in logs)
-- No prefix → pushed as **GitHub Secret** (masked in logs)
-- `_B64` suffix → value is a **file path**; the script reads and base64-encodes the file before pushing
+### Conventions in `.secrets.env`
+- `[secrets]` section → pushed as **GitHub Secrets** (masked in logs)
+- `[variables]` section → pushed as **GitHub Variables** (visible in logs)
+- `_BASE64` or `_B64` suffix → value is a **file path**; the script reads and base64-encodes the file before pushing
 
 ### Key secrets/variables required by the workflow
 **Android:** `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_PASSWORD`, `GOOGLE_PLAY_JSON_KEY_BASE64`  

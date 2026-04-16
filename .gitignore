@@ -2,5 +2,9 @@
 .secrets.env
 */.secrets.env
 
+# Signing keys and credentials
+files/
+*/files/
+
 # macOS
 .DS_Store

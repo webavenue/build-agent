@@ -18,11 +18,11 @@
 #   DRY_RUN=1 ./scripts/push-secrets.sh --project my-app WebAvenueIG/repo1
 #
 # CONVENTIONS in .secrets.env:
-#   - Keys prefixed with VAR_  → pushed as GitHub Variables  (gh variable set)
-#   - All other keys           → pushed as GitHub Secrets    (gh secret set)
-#   - Keys suffixed with _B64  → value is a FILE PATH; the file is base64-encoded before pushing
-#   - Lines starting with #    → comments, ignored
-#   - Blank lines              → ignored
+#   - [secrets] section              → pushed as GitHub Secrets    (masked in logs)
+#   - [variables] section            → pushed as GitHub Variables  (visible in logs)
+#   - Keys suffixed with _BASE64 or _B64 → value is a FILE PATH; base64-encoded before pushing
+#   - Lines starting with #          → comments, ignored
+#   - Blank lines                    → ignored
 
 set -euo pipefail
 
@@ -100,17 +100,31 @@ fi
 DRY_RUN="${DRY_RUN:-0}"
 [[ "$DRY_RUN" == "1" ]] && warn "DRY RUN mode — no changes will be made."
 
-# ── Parse an env file into SECRETS / VARIABLES (later calls override earlier) ─
-declare -A SECRETS
-declare -A VARIABLES
+# ── Parse env files into a temp file ─────────────────────────────────────────
+# Each line in the temp file: <section> TAB <key> TAB <value>
+# Root is parsed first, project second — so project entries override root via
+# awk deduplication (last occurrence of each key wins).
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
 
 parse_env_file() {
   local file="$1"
   [[ ! -f "$file" ]] && return
+  local section="secrets"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     [[ -z "${line//[[:space:]]/}" ]] && continue
+
+    # Section headers: [secrets] or [variables]
+    if [[ "$line" =~ ^\[([a-z]+)\]$ ]]; then
+      section="${BASH_REMATCH[1]}"
+      if [[ "$section" != "secrets" && "$section" != "variables" ]]; then
+        warn "Unknown section [$section] in $file — skipping"
+        section="secrets"
+      fi
+      continue
+    fi
 
     if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
       local key="${BASH_REMATCH[1]}"
@@ -121,35 +135,45 @@ parse_env_file() {
         value="${BASH_REMATCH[1]}"
       fi
 
-      # _B64 suffix → value is a file path; base64-encode its contents
-      if [[ "$key" == *_B64 ]]; then
-        local file_path="$value"
-        [[ "$file_path" != /* ]] && file_path="$REPO_ROOT/$file_path"
-        if [[ ! -f "$file_path" ]]; then
-          warn "File not found for $key: $file_path — skipping"
+      # _BASE64 or _B64 suffix → value is a file path; base64-encode its contents
+      if [[ "$key" == *_BASE64 || "$key" == *_B64 ]]; then
+        local fp="$value"
+        [[ "$fp" != /* ]] && fp="$REPO_ROOT/$fp"
+        if [[ ! -f "$fp" ]]; then
+          warn "File not found for $key: $fp — skipping"
           continue
         fi
-        value="$(base64 < "$file_path" | tr -d '\n')"
+        value="$(base64 < "$fp" | tr -d '\n')"
       fi
 
-      # VAR_ prefix → GitHub Variable; otherwise → GitHub Secret
-      if [[ "$key" == VAR_* ]]; then
-        VARIABLES["${key#VAR_}"]="$value"
-      else
-        SECRETS["$key"]="$value"
-      fi
+      # Write tab-separated: section TAB key TAB value
+      printf '%s\t%s\t%s\n' "$section" "$key" "$value" >> "$TMP"
     fi
   done < "$file"
 }
 
-# Load root first, then project (project overrides root)
+# Load root first, then project (project entries override root via awk below)
 parse_env_file "$ROOT_ENV"
 [[ -n "$PROJECT_ENV" ]] && parse_env_file "$PROJECT_ENV"
 
+# Deduplicate: keep last occurrence of each (section+key) pair, preserving order
+DEDUPED=$(awk -F'\t' '
+{
+  composite = $1 "\t" $2
+  data[composite] = $0
+  if (!(composite in seen)) { order[++n] = composite; seen[composite] = 1 }
+}
+END {
+  for (i = 1; i <= n; i++) print data[order[i]]
+}' "$TMP")
+
+secret_count=$(echo "$DEDUPED" | grep -c "^secrets" || true)
+var_count=$(echo "$DEDUPED" | grep -c "^variables" || true)
+
 if [[ -n "$PROJECT" ]]; then
-  info "Loaded root + project '$PROJECT' secrets — ${#SECRETS[@]} secret(s), ${#VARIABLES[@]} variable(s)"
+  info "Loaded root + project '$PROJECT' — ${secret_count} secret(s), ${var_count} variable(s)"
 else
-  info "Loaded root secrets — ${#SECRETS[@]} secret(s), ${#VARIABLES[@]} variable(s)"
+  info "Loaded root — ${secret_count} secret(s), ${var_count} variable(s)"
 fi
 echo ""
 
@@ -157,25 +181,23 @@ echo ""
 for repo in "${REPOS[@]}"; do
   echo -e "${BLUE}━━━ $repo ━━━${NC}"
 
-  for key in "${!SECRETS[@]}"; do
-    value="${SECRETS[$key]}"
-    if [[ "$DRY_RUN" == "1" ]]; then
-      echo "  [dry-run] secret   $key"
+  while IFS=$(printf '\t') read -r section key value; do
+    if [[ "$section" == "secrets" ]]; then
+      if [[ "$DRY_RUN" == "1" ]]; then
+        echo "  [dry-run] secret   $key"
+      else
+        echo -n "$value" | gh secret set "$key" --repo "$repo"
+        success "secret   $key"
+      fi
     else
-      echo -n "$value" | gh secret set "$key" --repo "$repo" --body -
-      success "secret   $key"
+      if [[ "$DRY_RUN" == "1" ]]; then
+        echo "  [dry-run] variable $key = $value"
+      else
+        gh variable set "$key" --repo "$repo" --body "$value"
+        success "variable $key"
+      fi
     fi
-  done
-
-  for key in "${!VARIABLES[@]}"; do
-    value="${VARIABLES[$key]}"
-    if [[ "$DRY_RUN" == "1" ]]; then
-      echo "  [dry-run] variable $key = $value"
-    else
-      gh variable set "$key" --repo "$repo" --body "$value"
-      success "variable $key"
-    fi
-  done
+  done <<< "$DEDUPED"
 
   echo ""
 done
