@@ -94,6 +94,23 @@ jobs:
           mkdir -p ci-certs
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ci-certs/release.keystore
 
+      # AGP uses BouncyCastle to read keystores. Newer PKCS12 keystores (created
+      # with JDK 9+) use AES-256 which older BouncyCastle can't parse ("Tag number
+      # over 30"). The JDK's own keytool CAN read any PKCS12, so we convert to JKS
+      # which BouncyCastle has always supported.
+      - name: Convert keystore to JKS
+        env:
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          keytool -importkeystore \
+            -srckeystore ci-certs/release.keystore \
+            -destkeystore ci-certs/release.jks \
+            -deststoretype JKS \
+            -srcstorepass "${STORE_PASS}" \
+            -deststorepass "${STORE_PASS}" \
+            -noprompt 2>&1 | grep -v "Warning"
+          echo "✓ Keystore converted to JKS"
+
       - name: Decode Google Play key
         run: |
           echo "${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}" | base64 -d > ci-certs/google-play-key.json
@@ -130,12 +147,9 @@ jobs:
 
       - name: Run fastlane
         env:
-          # Keystore created with JDK 9+ uses AES-256 PKCS12 which older
-          # BouncyCastle (inside AGP) can't parse. Legacy mode fixes this.
-          JAVA_TOOL_OPTIONS: '-Dkeystore.pkcs12.legacy'
           APP_NAME: ${{ vars.APP_NAME }}
           ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
-          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/ci-certs/release.keystore
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/ci-certs/release.jks
           ANDROID_KEYSTORE_ALIAS: ${{ vars.ANDROID_KEYSTORE_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
