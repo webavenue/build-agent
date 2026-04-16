@@ -130,6 +130,9 @@ jobs:
 
       - name: Run fastlane
         env:
+          # Keystore created with JDK 9+ uses AES-256 PKCS12 which older
+          # BouncyCastle (inside AGP) can't parse. Legacy mode fixes this.
+          JAVA_TOOL_OPTIONS: '-Dkeystore.pkcs12.legacy'
           APP_NAME: ${{ vars.APP_NAME }}
           ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
           ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/ci-certs/release.keystore
