@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh auth *)",
+      "Bash(DRY_RUN=1 ./scripts/push-secrets.sh --project colorwood-associations-dev webavenue/Connect-Word)",
+      "Bash(./scripts/push-secrets.sh --project colorwood-associations-dev webavenue/Connect-Word)",
+      "Bash(DRY_RUN=1 ./scripts/push-secrets.sh --project golf-tycoon webavenue/GolfTycoon)",
+      "Bash(./scripts/push-secrets.sh --project golf-tycoon webavenue/GolfTycoon)"
+    ]
+  }
+}

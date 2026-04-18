@@ -322,6 +322,7 @@ jobs:
           ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
           TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [Android] ${VERSION_CODE}(${VERSION_NAME}) QA"
@@ -339,7 +340,7 @@ jobs:
             -d "{
               \"data\": {
                 \"name\": \"${TASK_NAME}\",
-                \"notes\": \"Release Notes:\n${RELEASE_NOTES}\",
+                \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
                 \"projects\": ${PROJECTS},
                 \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
               }
@@ -378,6 +379,7 @@ jobs:
           ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
           TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [iOS] ${VERSION_CODE}(${VERSION_NAME}) QA"
@@ -395,7 +397,7 @@ jobs:
             -d "{
               \"data\": {
                 \"name\": \"${TASK_NAME}\",
-                \"notes\": \"Release Notes:\n${RELEASE_NOTES}\",
+                \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
                 \"projects\": ${PROJECTS},
                 \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
               }
@@ -431,6 +433,7 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
+          BRANCH: ${{ github.ref_name }}
           ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
           IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -468,10 +471,10 @@ jobs:
 
           if [ "$ALL_SUCCESS" = "true" ]; then
             if [ "$ACTION" = "build only" ]; then
-              MESSAGE="Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:memo: Release Details\n• ${RELEASE_NOTES}"
+              MESSAGE="Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n• ${RELEASE_NOTES}"
               MESSAGE="${MESSAGE}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_"
             else
-              MESSAGE="Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:memo: Release Details\n• ${RELEASE_NOTES}"
+              MESSAGE="Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n• ${RELEASE_NOTES}"
 
               if [ "$ANDROID_RESULT" = "success" ]; then
                 ANDROID_LINE="\n\n:robot_face: Android → Play Store internal track"
@@ -493,7 +496,7 @@ jobs:
               fi
             fi
           else
-            MESSAGE="Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:mag: <${RUN_URL}|View logs>"
+            MESSAGE="Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>"
           fi
 
           curl -s -X POST "https://slack.com/api/chat.postMessage" \
