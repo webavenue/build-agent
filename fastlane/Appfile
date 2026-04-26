@@ -1,0 +1,10 @@
+# Fastlane Appfile
+# Values are loaded from .env — do not hardcode secrets here.
+
+app_identifier(ENV["IOS_BUNDLE_ID"])
+apple_id(ENV["APPLE_ID"] || "")       # optional, API key auth doesn't need this
+team_id(ENV["APPLE_TEAM_ID"])
+
+# Google Play
+json_key_file(ENV["GOOGLE_PLAY_JSON_KEY_PATH"])
+package_name(ENV["ANDROID_PACKAGE_NAME"])

@@ -1,0 +1,228 @@
+# Fastlane Fastfile — Infinity Games Build Agent
+# Docs: https://docs.fastlane.tools
+
+# Load .env automatically
+require 'dotenv'
+Dotenv.load('../.env')
+
+default_platform(:ios)
+
+# ─────────────────────────────────────────────
+# ANDROID LANES
+# ─────────────────────────────────────────────
+platform :android do
+
+  desc "Inject VERSION_CODE and VERSION_NAME into android/app/build.gradle"
+  private_lane :set_android_version do
+    version_code = ENV["VERSION_CODE"]
+    version_name = ENV["VERSION_NAME"]
+
+    next unless version_code && version_name
+
+    build_gradle_path = File.join(ENV["CAPACITOR_PROJECT_PATH"], "android/app/build.gradle")
+    content = File.read(build_gradle_path)
+    content = content.gsub(/versionCode\s+\d+/, "versionCode #{version_code}")
+    content = content.gsub(/versionName\s+"[^"]*"/, "versionName \"#{version_name}\"")
+    File.write(build_gradle_path, content)
+
+    UI.success("Version set → #{version_name} (#{version_code})")
+  end
+
+  desc "Abort if VERSION_CODE in .env is not higher than what's already on Play Store"
+  private_lane :validate_android_version do
+    intended = ENV["VERSION_CODE"].to_i
+    max_live = 0
+
+    ["internal", "alpha", "beta", "production"].each do |track|
+      begin
+        codes = google_play_track_version_codes(
+          track:        track,
+          json_key:     ENV["GOOGLE_PLAY_JSON_KEY_PATH"],
+          package_name: ENV["ANDROID_PACKAGE_NAME"],
+        )
+        max_live = [max_live, codes.max || 0].max
+      rescue
+        # Track is empty or doesn't exist yet — skip
+      end
+    end
+
+    if max_live == 0
+      UI.message("No existing builds found on Play Store — proceeding with version code #{intended}.")
+    elsif intended <= max_live
+      UI.user_error!(
+        "VERSION_CODE #{intended} is not higher than the latest on Play Store (#{max_live}).\n" \
+        "Update VERSION_CODE in credentials/<project>/.env to at least #{max_live + 1} and retry."
+      )
+    else
+      UI.success("Version code check passed — Play Store: #{max_live}, building: #{intended} ✓")
+    end
+  end
+
+  desc "Build a signed Android APK (release) — installable artifact for QA / build-only CI runs"
+  lane :build_apk do
+    set_android_version
+    gradle(
+      task: "assemble",
+      build_type: "Release",
+      project_dir: File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'android')),
+      properties: {
+        "android.injected.signing.store.file"     => File.expand_path(ENV['ANDROID_KEYSTORE_PATH']),
+        "android.injected.signing.store.password" => ENV["ANDROID_KEYSTORE_PASSWORD"],
+        "android.injected.signing.key.alias"      => ENV["ANDROID_KEYSTORE_ALIAS"],
+        "android.injected.signing.key.password"   => ENV["ANDROID_KEY_PASSWORD"],
+      }
+    )
+  end
+
+  desc "Build a signed Android AAB (release)"
+  lane :build do
+    set_android_version
+    gradle(
+      task: "bundle",
+      build_type: "Release",
+      project_dir: File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'android')),
+      properties: {
+        "android.injected.signing.store.file"     => File.expand_path(ENV['ANDROID_KEYSTORE_PATH']),
+        "android.injected.signing.store.password" => ENV["ANDROID_KEYSTORE_PASSWORD"],
+        "android.injected.signing.key.alias"      => ENV["ANDROID_KEYSTORE_ALIAS"],
+        "android.injected.signing.key.password"   => ENV["ANDROID_KEY_PASSWORD"],
+      }
+    )
+  end
+
+  desc "Upload latest AAB to Google Play (internal track by default)"
+  lane :upload do
+    supply(
+      track: ENV["GOOGLE_PLAY_TRACK"] || "internal",
+      aab: lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH],
+      json_key: ENV["GOOGLE_PLAY_JSON_KEY_PATH"],
+      package_name: ENV["ANDROID_PACKAGE_NAME"],
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_changelogs: false,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+    )
+  end
+
+  desc "Build + Upload to Google Play in one shot"
+  lane :ship do
+    build
+    upload
+    notify_success("Android")
+  end
+
+end
+
+# ─────────────────────────────────────────────
+# iOS LANES
+# ─────────────────────────────────────────────
+platform :ios do
+
+  desc "Inject VERSION_NAME and VERSION_CODE into the Xcode project"
+  private_lane :set_ios_version do
+    version_name = ENV["VERSION_NAME"]
+    version_code = ENV["VERSION_CODE"]
+
+    next unless version_name && version_code
+
+    xcodeproj = File.expand_path(File.join(ENV["CAPACITOR_PROJECT_PATH"], "ios/App/App.xcodeproj"))
+
+    increment_version_number(
+      version_number: version_name,
+      xcodeproj:      xcodeproj,
+    )
+    increment_build_number(
+      build_number: version_code,
+      xcodeproj:    xcodeproj,
+    )
+
+    UI.success("Version set → #{version_name} (#{version_code})")
+  end
+
+  desc "Set manual signing on the App target only (not Pods/Firebase targets)"
+  private_lane :set_ios_signing do
+    xcodeproj = File.expand_path(File.join(ENV["CAPACITOR_PROJECT_PATH"], "ios/App/App.xcodeproj"))
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path:               xcodeproj,
+      targets:            ["App"],          # Only the App target — not Pods, Firebase, etc.
+      team_id:            ENV["APPLE_TEAM_ID"],
+      code_sign_identity: "Apple Distribution",
+      profile_name:       ENV["IOS_PROVISIONING_PROFILE_NAME"],
+      bundle_identifier:  ENV["IOS_BUNDLE_ID"],
+    )
+  end
+
+  desc "Configure App Store Connect API auth"
+  private_lane :setup_api_key do
+    app_store_connect_api_key(
+      key_id:        ENV["APPLE_API_KEY_ID"],
+      issuer_id:     ENV["APPLE_API_ISSUER_ID"],
+      key_filepath:  ENV["APPLE_API_KEY_PATH"],
+      in_house:      false,
+    )
+  end
+
+  desc "Build a signed iOS IPA (release)"
+  lane :build do
+    set_ios_version
+    set_ios_signing          # Patches App target only — leaves Pods/Firebase targets untouched
+    setup_api_key
+    workspace = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App/App.xcworkspace'))
+    project   = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App/App.xcodeproj'))
+    gym(
+      scheme:           ENV["IOS_SCHEME"] || "App",
+      workspace:        File.exist?(workspace) ? workspace : nil,
+      project:          File.exist?(workspace) ? nil : project,
+      configuration:    "Release",
+      output_directory: "./build_output",
+      clean:            true,
+      # No xcargs signing overrides — update_code_signing_settings already
+      # patched the xcodeproj so only the App target has manual signing set.
+      # Global xcargs would bleed into Firebase/Pods targets and cause errors.
+      export_options: {
+        method:               "app-store",
+        signingStyle:         "manual",
+        signingCertificate:   "Apple Distribution",
+        teamID:               ENV["APPLE_TEAM_ID"],
+        provisioningProfiles: {
+          ENV["IOS_BUNDLE_ID"] => ENV["IOS_PROVISIONING_PROFILE_NAME"],
+        },
+      },
+    )
+  end
+
+  desc "Upload IPA to TestFlight"
+  lane :upload do
+    setup_api_key
+    pilot(
+      ipa:              lane_context[SharedValues::IPA_OUTPUT_PATH],
+      groups:           ENV["TESTFLIGHT_GROUPS"],
+      skip_waiting_for_build_processing: true,
+      # changelog omitted intentionally — supplying it forces fastlane to wait for
+      # the build to appear in App Store Connect before it can attach the notes,
+      # defeating skip_waiting_for_build_processing. Release notes are added
+      # manually in TestFlight / App Store Connect after processing completes.
+    )
+  end
+
+  desc "Build + Upload to TestFlight in one shot"
+  lane :ship do
+    build
+    upload
+    notify_success("iOS")
+  end
+
+end
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def notify_success(platform)
+  puts ""
+  puts "✅  #{platform} build shipped successfully!"
+  puts "    App: #{ENV['APP_NAME']}"
+  puts "    Time: #{Time.now}"
+  puts ""
+end

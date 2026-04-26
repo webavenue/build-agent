@@ -1,0 +1,4 @@
+# Fastlane Pluginfile
+# Run `fastlane install_plugins` to install these.
+
+gem 'fastlane-plugin-dotenv'
