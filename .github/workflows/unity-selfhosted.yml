@@ -543,7 +543,8 @@ jobs:
               }
             }")
 
-          TASK_GID=$(echo $TASK_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['gid'])" 2>/dev/null)
+          echo "Asana response: $TASK_RESPONSE"
+          TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
 
           if [ -z "$TASK_GID" ]; then
             echo "⚠ Failed to create Android Asana task. Response: $TASK_RESPONSE"
@@ -600,7 +601,8 @@ jobs:
               }
             }")
 
-          TASK_GID=$(echo $TASK_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['gid'])" 2>/dev/null)
+          echo "Asana response: $TASK_RESPONSE"
+          TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
 
           if [ -z "$TASK_GID" ]; then
             echo "⚠ Failed to create iOS Asana task. Response: $TASK_RESPONSE"
