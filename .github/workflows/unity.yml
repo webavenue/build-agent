@@ -13,10 +13,11 @@ name: Unity Build (Reusable)
 #
 # VERSIONING
 #   Project holds the marketing version as X.Y in ProjectSettings
-#   (bundleVersion). CI appends github.run_number to produce the
-#   full version string (X.Y.run_number) and uses (offset + run_number)
-#   as the integer build/version code. Bump X.Y in the Unity project
-#   when cutting a new feature version.
+#   (bundleVersion). CI appends (offset + github.run_number) to produce
+#   the full version string (X.Y.code) and uses the same integer as
+#   the build/version code. Marketing version and build code stay in
+#   lockstep. Bump X.Y in the Unity project when cutting a new feature
+#   version.
 # ─────────────────────────────────────────────────────────────
 on:
   workflow_call:
@@ -121,15 +122,17 @@ jobs:
             echo "::error::ProjectSettings bundleVersion must be X.Y format (got '$BASE'). Update it in the Unity project."
             exit 1
           fi
-          FULL="${BASE}.${{ github.run_number }}"
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          FULL="${BASE}.${CODE}"
           echo "base=$BASE" >> $GITHUB_OUTPUT
           echo "full=$FULL" >> $GITHUB_OUTPUT
-          echo "Project version: $BASE + runner ${{ github.run_number }} → $FULL"
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Project version: $BASE + code $CODE → $FULL"
 
       - name: Compute version code
         id: version
         run: |
-          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          CODE=${{ steps.base_version.outputs.code }}
           echo "code=$CODE" >> $GITHUB_OUTPUT
           echo "Version code will be: $CODE"
 
@@ -278,15 +281,17 @@ jobs:
             echo "::error::ProjectSettings bundleVersion must be X.Y format (got '$BASE'). Update it in the Unity project."
             exit 1
           fi
-          FULL="${BASE}.${{ github.run_number }}"
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          FULL="${BASE}.${CODE}"
           echo "base=$BASE" >> $GITHUB_OUTPUT
           echo "full=$FULL" >> $GITHUB_OUTPUT
-          echo "Project version: $BASE + runner ${{ github.run_number }} → $FULL"
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Project version: $BASE + code $CODE → $FULL"
 
       - name: Compute version code
         id: version
         run: |
-          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          CODE=${{ steps.base_version.outputs.code }}
           echo "code=$CODE" >> $GITHUB_OUTPUT
           echo "Version code will be: $CODE"
 

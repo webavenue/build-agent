@@ -68,6 +68,10 @@ jobs:
       group: unity-mac-mini-${{ github.repository }}
       cancel-in-progress: false
 
+    outputs:
+      version_full: ${{ steps.base_version.outputs.full }}
+      version_code: ${{ steps.base_version.outputs.code }}
+
     steps:
 
       - name: Checkout code
@@ -120,15 +124,17 @@ jobs:
             echo "::error::ProjectSettings bundleVersion must be X.Y format (got '$BASE')."
             exit 1
           fi
-          FULL="${BASE}.${{ github.run_number }}"
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          FULL="${BASE}.${CODE}"
           echo "base=$BASE" >> $GITHUB_OUTPUT
           echo "full=$FULL" >> $GITHUB_OUTPUT
-          echo "Project version: $BASE + runner ${{ github.run_number }} → $FULL"
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Project version: $BASE + code $CODE → $FULL"
 
       - name: Compute version code
         id: version
         run: |
-          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          CODE=${{ steps.base_version.outputs.code }}
           echo "code=$CODE" >> $GITHUB_OUTPUT
           echo "Version code: $CODE"
 
@@ -217,6 +223,10 @@ jobs:
     concurrency:
       group: unity-mac-mini-${{ github.repository }}
       cancel-in-progress: false
+
+    outputs:
+      version_full: ${{ steps.base_version.outputs.full }}
+      version_code: ${{ steps.base_version.outputs.code }}
 
     steps:
 
@@ -464,3 +474,227 @@ jobs:
           if [ -n "${{ steps.profile.outputs.profile_uuid }}" ]; then
             rm -f ~/Library/MobileDevice/Provisioning\ Profiles/${{ steps.profile.outputs.profile_uuid }}.mobileprovision || true
           fi
+
+
+  # ───────────────────────────────────────────────────────────
+  # NOTIFY — Asana QA tasks + Slack message
+  # Runs on GitHub-hosted Ubuntu (just makes API calls, no need
+  # to occupy the Mac mini).
+  # ───────────────────────────────────────────────────────────
+  notify:
+    name: Notify
+    needs: [android, ios]
+    if: >
+      always() &&
+      (needs.android.result != 'skipped' || needs.ios.result != 'skipped') &&
+      (inputs.do_slack || inputs.do_asana)
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # Either job's outputs work — they compute the same version. Prefer
+      # android's; fall back to ios when only iOS ran.
+      - name: Resolve version
+        id: version
+        run: |
+          FULL="${{ needs.android.outputs.version_full }}"
+          CODE="${{ needs.android.outputs.version_code }}"
+          if [ -z "$FULL" ]; then
+            FULL="${{ needs.ios.outputs.version_full }}"
+            CODE="${{ needs.ios.outputs.version_code }}"
+          fi
+          echo "full=$FULL" >> $GITHUB_OUTPUT
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Resolved: $FULL ($CODE)"
+
+      - name: Create Android Asana QA task
+        id: asana_android
+        if: needs.android.result == 'success' && inputs.do_asana
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_FULL: ${{ steps.version.outputs.full }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [Android] ${VERSION_CODE}(${VERSION_FULL}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          if [ -n "$ASANA_PROJECT_ID" ]; then
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
+          else
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
+          fi
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"data\": {
+                \"name\": \"${TASK_NAME}\",
+                \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
+                \"projects\": ${PROJECTS},
+                \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
+              }
+            }")
+
+          TASK_GID=$(echo $TASK_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['gid'])" 2>/dev/null)
+
+          if [ -z "$TASK_GID" ]; then
+            echo "⚠ Failed to create Android Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> $GITHUB_OUTPUT
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ Android Asana task created: ${TASK_URL}"
+            echo "task_url=${TASK_URL}" >> $GITHUB_OUTPUT
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      - name: Create iOS Asana QA task
+        id: asana_ios
+        if: needs.ios.result == 'success' && inputs.do_asana
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_FULL: ${{ steps.version.outputs.full }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [iOS] ${VERSION_CODE}(${VERSION_FULL}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          if [ -n "$ASANA_PROJECT_ID" ]; then
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
+          else
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
+          fi
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"data\": {
+                \"name\": \"${TASK_NAME}\",
+                \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
+                \"projects\": ${PROJECTS},
+                \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
+              }
+            }")
+
+          TASK_GID=$(echo $TASK_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['gid'])" 2>/dev/null)
+
+          if [ -z "$TASK_GID" ]; then
+            echo "⚠ Failed to create iOS Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> $GITHUB_OUTPUT
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ iOS Asana task created: ${TASK_URL}"
+            echo "task_url=${TASK_URL}" >> $GITHUB_OUTPUT
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      - name: Slack notification
+        if: always() && inputs.do_slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          SLACK_ANDROID_DOWNLOAD_URL: ${{ vars.SLACK_ANDROID_DOWNLOAD_URL }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          VERSION_FULL: ${{ steps.version.outputs.full }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          BRANCH: ${{ github.ref_name }}
+          ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
+          IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ANDROID_RESULT="${{ needs.android.result }}"
+          IOS_RESULT="${{ needs.ios.result }}"
+
+          PLATFORMS=""
+          ALL_SUCCESS=true
+
+          if [ "$ANDROID_RESULT" != "skipped" ]; then
+            if [ "$ANDROID_RESULT" = "success" ]; then
+              PLATFORMS="Android"
+            else
+              PLATFORMS="Android :x:"
+              ALL_SUCCESS=false
+            fi
+          fi
+
+          if [ "$IOS_RESULT" != "skipped" ]; then
+            if [ "$IOS_RESULT" = "success" ]; then
+              IOS_LABEL="iOS"
+            else
+              IOS_LABEL="iOS :x:"
+              ALL_SUCCESS=false
+            fi
+            if [ -n "$PLATFORMS" ]; then
+              PLATFORMS="${PLATFORMS} + ${IOS_LABEL}"
+            else
+              PLATFORMS="${IOS_LABEL}"
+            fi
+          fi
+
+          if [ "$ALL_SUCCESS" = "true" ]; then
+            MESSAGE="Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_FULL} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n• ${RELEASE_NOTES}"
+
+            if [ "$ANDROID_RESULT" = "success" ]; then
+              ANDROID_LINE="\n\n:robot_face: Android → Play Store internal track"
+              if [ -n "$SLACK_ANDROID_DOWNLOAD_URL" ]; then
+                ANDROID_LINE="${ANDROID_LINE} | <${SLACK_ANDROID_DOWNLOAD_URL}|Download>"
+              fi
+              MESSAGE="${MESSAGE}${ANDROID_LINE}"
+            fi
+
+            if [ "$IOS_RESULT" = "success" ]; then
+              MESSAGE="${MESSAGE}\n:apple: iOS → TestFlight"
+            fi
+
+            if [ -n "$ANDROID_TASK_URL" ]; then
+              MESSAGE="${MESSAGE}\n:pushpin: Android QA: <${ANDROID_TASK_URL}|View task>"
+            fi
+            if [ -n "$IOS_TASK_URL" ]; then
+              MESSAGE="${MESSAGE}\n:pushpin: iOS QA: <${IOS_TASK_URL}|View task>"
+            fi
+          else
+            MESSAGE="Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_FULL} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>"
+          fi
+
+          curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"channel\": \"${SLACK_CHANNEL_ID}\",
+              \"text\": \"${MESSAGE}\"
+            }" > /dev/null
+          echo "✓ Slack notification sent"
