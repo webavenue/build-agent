@@ -277,14 +277,17 @@ jobs:
             echo "::error::ProjectSettings bundleVersion must be X.Y format (got '$BASE')."
             exit 1
           fi
-          FULL="${BASE}.${{ github.run_number }}"
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          FULL="${BASE}.${CODE}"
           echo "base=$BASE" >> $GITHUB_OUTPUT
           echo "full=$FULL" >> $GITHUB_OUTPUT
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Project version: $BASE + code $CODE → $FULL"
 
       - name: Compute version code
         id: version
         run: |
-          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          CODE=${{ steps.base_version.outputs.code }}
           echo "code=$CODE" >> $GITHUB_OUTPUT
 
       - name: Patch version in ProjectSettings
