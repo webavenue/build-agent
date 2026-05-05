@@ -411,10 +411,12 @@ jobs:
             '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' \
             > ci-certs/asc-api-key.json
 
+      # Skipping --changelog and --distribute_external on purpose. Both
+      # would force fastlane to wait for the build to appear in App
+      # Store Connect (10–30 min), which holds the Mac mini's concurrency
+      # lock for that whole window. Release notes go out via Slack;
+      # TestFlight tester groups can be assigned via the ASC web UI.
       - name: Upload to TestFlight
-        env:
-          TESTFLIGHT_GROUPS: ${{ vars.TESTFLIGHT_GROUPS }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
           IPA_PATH=$(find "${{ github.workspace }}/build/export" -name "*.ipa" | head -n 1)
           if [ -z "$IPA_PATH" ]; then
@@ -423,23 +425,11 @@ jobs:
           fi
           echo "Uploading: $IPA_PATH"
 
-          if [ -n "$TESTFLIGHT_GROUPS" ]; then
-            fastlane pilot upload \
-              --api_key_path ci-certs/asc-api-key.json \
-              --ipa "$IPA_PATH" \
-              --changelog "$RELEASE_NOTES" \
-              --distribute_external true \
-              --groups "$TESTFLIGHT_GROUPS" \
-              --skip_submission true \
-              --skip_waiting_for_build_processing true
-          else
-            fastlane pilot upload \
-              --api_key_path ci-certs/asc-api-key.json \
-              --ipa "$IPA_PATH" \
-              --changelog "$RELEASE_NOTES" \
-              --skip_submission true \
-              --skip_waiting_for_build_processing true
-          fi
+          fastlane pilot upload \
+            --api_key_path ci-certs/asc-api-key.json \
+            --ipa "$IPA_PATH" \
+            --skip_submission true \
+            --skip_waiting_for_build_processing true
 
       # Decoded API key is the only sensitive file. Build outputs kept for debugging.
       - name: Clean up
