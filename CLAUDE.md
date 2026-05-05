@@ -19,7 +19,7 @@ scripts/push-secrets.sh              # Pushes secrets/variables to target GitHub
 
 Caller repos reference it like:
 ```yaml
-uses: <org>/build-agent/.github/workflows/capacitor.yml@main
+uses: webavenue/build-agent/.github/workflows/capacitor.yml@main
 ```
 
 ### Workflow inputs
@@ -55,19 +55,19 @@ Merges root + project secrets and pushes to one or more GitHub repos.
 
 ```bash
 # Shared + project-specific secrets (project overrides root):
-./scripts/push-secrets.sh --project my-app WebAvenueIG/my-app-repo
+./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
 
 # Shared secrets only (no project):
-./scripts/push-secrets.sh WebAvenueIG/some-repo
+./scripts/push-secrets.sh webavenue/some-repo
 
 # Multiple repos:
-./scripts/push-secrets.sh --project my-app WebAvenueIG/repo1 WebAvenueIG/repo2
+./scripts/push-secrets.sh --project my-app webavenue/repo1 webavenue/repo2
 
 # Via env var:
-GITHUB_REPOS="WebAvenueIG/repo1" ./scripts/push-secrets.sh --project my-app
+GITHUB_REPOS="webavenue/repo1" ./scripts/push-secrets.sh --project my-app
 
 # Dry-run — shows what would be pushed without calling gh:
-DRY_RUN=1 ./scripts/push-secrets.sh --project my-app WebAvenueIG/my-app-repo
+DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
 ```
 
 **Prerequisites:** `gh` CLI installed and authenticated (`gh auth login`). At least one of root `.secrets.env` or `<project>/.secrets.env` must exist.

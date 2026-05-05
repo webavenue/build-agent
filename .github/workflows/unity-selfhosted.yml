@@ -1,0 +1,458 @@
+name: Unity Build (Self-Hosted Mac)
+
+# ─────────────────────────────────────────────────────────────
+# REUSABLE WORKFLOW — runs Unity Android + iOS builds on a
+# self-hosted macOS runner (e.g. an office Mac mini).
+#
+# Differences vs unity.yml (the GitHub-hosted version):
+#   - Calls Unity Editor natively (no Docker / game-ci action)
+#   - One iOS job (no Linux→macOS artifact handoff)
+#   - Unity Library cache persists in workspace between runs
+#   - License activated once on the Mac (not per-run via secrets)
+#   - Requires Builder.cs in Assets/Editor/ of the Unity project
+#
+# Each Unity project repo registers its own runner with labels
+# matching `runner_labels`. The `flock` lock ensures only one
+# Unity Editor instance runs at a time on the mini, even when
+# multiple repos call this workflow concurrently.
+# ─────────────────────────────────────────────────────────────
+on:
+  workflow_call:
+    inputs:
+      build_android:
+        type: boolean
+        required: false
+        default: true
+      build_ios:
+        type: boolean
+        required: false
+        default: true
+      release_notes:
+        type: string
+        required: false
+        default: 'Bug fixes and performance improvements.'
+      version_code_offset:
+        description: 'Added to github.run_number to produce the build/version code.'
+        type: number
+        required: false
+        default: 100
+      pre_build_cleanup:
+        description: 'Newline-separated asset paths to delete before the Unity build runs. Matching .meta files are also removed.'
+        type: string
+        required: false
+        default: ''
+      runner_labels:
+        description: 'JSON array of self-hosted runner labels.'
+        type: string
+        required: false
+        default: '["self-hosted","macOS","unity"]'
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────
+  # ANDROID
+  # ───────────────────────────────────────────────────────────
+  android:
+    name: Build & Upload Android
+    if: ${{ inputs.build_android }}
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    concurrency:
+      group: unity-mac-mini-${{ github.repository }}
+      cancel-in-progress: false
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          clean: false
+
+      # Self-hosted workspace persists. Reset tracked files (undo previous
+      # ProjectSettings sed) but keep Library/ and build/ to retain caches.
+      - name: Reset working tree (preserve Library cache)
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx -e Library/ -e build/ -e ci-certs/ -e Temp/
+
+      - name: Pre-build cleanup
+        if: inputs.pre_build_cleanup != ''
+        env:
+          CLEANUP_PATHS: ${{ inputs.pre_build_cleanup }}
+        run: |
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if [ -e "$path" ]; then
+              rm -rf "$path"
+              [ -e "${path}.meta" ] && rm -f "${path}.meta"
+              echo "✓ Removed: $path"
+            else
+              echo "⚠ Not found (skipping): $path"
+            fi
+          done <<< "$CLEANUP_PATHS"
+
+      - name: Detect Unity version
+        id: unity
+        run: |
+          VERSION=$(grep "^m_EditorVersion:" ProjectSettings/ProjectVersion.txt | awk '{print $2}')
+          UNITY_PATH="/Applications/Unity/Hub/Editor/${VERSION}/Unity.app/Contents/MacOS/Unity"
+          if [ ! -x "$UNITY_PATH" ]; then
+            echo "::error::Unity ${VERSION} not installed at ${UNITY_PATH}. Install via Unity Hub on the runner machine."
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "path=$UNITY_PATH" >> $GITHUB_OUTPUT
+          echo "Detected Unity version: $VERSION"
+
+      - name: Read & validate project version
+        id: base_version
+        run: |
+          BASE=$(grep "^  bundleVersion:" ProjectSettings/ProjectSettings.asset | awk '{print $2}')
+          if ! echo "$BASE" | grep -qE '^[0-9]+\.[0-9]+$'; then
+            echo "::error::ProjectSettings bundleVersion must be X.Y format (got '$BASE')."
+            exit 1
+          fi
+          FULL="${BASE}.${{ github.run_number }}"
+          echo "base=$BASE" >> $GITHUB_OUTPUT
+          echo "full=$FULL" >> $GITHUB_OUTPUT
+          echo "Project version: $BASE + runner ${{ github.run_number }} → $FULL"
+
+      - name: Compute version code
+        id: version
+        run: |
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Version code: $CODE"
+
+      # macOS sed needs `-i ''` (BSD syntax). Linux uses `-i`.
+      - name: Patch version in ProjectSettings
+        run: |
+          sed -i '' "s/^  bundleVersion: .*/  bundleVersion: ${{ steps.base_version.outputs.full }}/" ProjectSettings/ProjectSettings.asset
+          sed -i '' "s/^  AndroidBundleVersionCode: .*/  AndroidBundleVersionCode: ${{ steps.version.outputs.code }}/" ProjectSettings/ProjectSettings.asset
+          echo "✓ bundleVersion           → ${{ steps.base_version.outputs.full }}"
+          echo "✓ AndroidBundleVersionCode → ${{ steps.version.outputs.code }}"
+
+      - name: Decode keystore
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p ci-certs
+          echo "$KS_B64" | base64 -d > ci-certs/release.keystore
+
+      # flock serializes Unity Editor invocations across all repos sharing
+      # this Mac mini — Unity license + Editor is single-instance per machine.
+      - name: Build Android (.aab)
+        env:
+          UNITY_PATH: ${{ steps.unity.outputs.path }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ vars.ANDROID_KEYSTORE_ALIAS }}
+        run: |
+          mkdir -p build/Android
+          flock /tmp/unity-mac-mini.lock \
+            "$UNITY_PATH" \
+              -batchmode \
+              -quit \
+              -nographics \
+              -projectPath "$GITHUB_WORKSPACE" \
+              -buildTarget Android \
+              -executeMethod Builder.BuildAndroid \
+              -logFile - \
+              -keystorePath "$GITHUB_WORKSPACE/ci-certs/release.keystore" \
+              -keystorePass "$KEYSTORE_PASS" \
+              -keyaliasName "$KEY_ALIAS" \
+              -keyaliasPass "$KEY_PASS"
+
+      - name: Decode Google Play key
+        env:
+          KEY_B64: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}
+        run: |
+          echo "$KEY_B64" | base64 -d > ci-certs/google-play-key.json
+
+      - name: Write release notes
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          mkdir -p fastlane/metadata/android/en-US/changelogs
+          NOTES="${RELEASE_NOTES:-Bug fixes and performance improvements.}"
+          echo "$NOTES" > fastlane/metadata/android/en-US/changelogs/${{ steps.version.outputs.code }}.txt
+
+      - name: Upload to Play Store
+        env:
+          ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
+          GOOGLE_PLAY_JSON_KEY_PATH: ${{ github.workspace }}/ci-certs/google-play-key.json
+          GOOGLE_PLAY_TRACK: ${{ vars.GOOGLE_PLAY_TRACK }}
+        run: |
+          fastlane supply \
+            --aab build/Android/Android.aab \
+            --package_name "${ANDROID_PACKAGE_NAME}" \
+            --json_key "${GOOGLE_PLAY_JSON_KEY_PATH}" \
+            --track "${GOOGLE_PLAY_TRACK}" \
+            --metadata_path fastlane/metadata/android \
+            --skip_upload_metadata true \
+            --skip_upload_images true \
+            --skip_upload_screenshots true
+
+      - name: Clean up sensitive files
+        if: always()
+        run: |
+          rm -rf ci-certs
+
+
+  # ───────────────────────────────────────────────────────────
+  # iOS — single job: Unity export → archive → TestFlight
+  # ───────────────────────────────────────────────────────────
+  ios:
+    name: Build & Upload iOS
+    if: ${{ inputs.build_ios }}
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    concurrency:
+      group: unity-mac-mini-${{ github.repository }}
+      cancel-in-progress: false
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          clean: false
+
+      - name: Reset working tree (preserve Library cache)
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx -e Library/ -e build/ -e ci-certs/ -e Temp/
+
+      - name: Pre-build cleanup
+        if: inputs.pre_build_cleanup != ''
+        env:
+          CLEANUP_PATHS: ${{ inputs.pre_build_cleanup }}
+        run: |
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if [ -e "$path" ]; then
+              rm -rf "$path"
+              [ -e "${path}.meta" ] && rm -f "${path}.meta"
+              echo "✓ Removed: $path"
+            else
+              echo "⚠ Not found (skipping): $path"
+            fi
+          done <<< "$CLEANUP_PATHS"
+
+      - name: Detect Unity version
+        id: unity
+        run: |
+          VERSION=$(grep "^m_EditorVersion:" ProjectSettings/ProjectVersion.txt | awk '{print $2}')
+          UNITY_PATH="/Applications/Unity/Hub/Editor/${VERSION}/Unity.app/Contents/MacOS/Unity"
+          if [ ! -x "$UNITY_PATH" ]; then
+            echo "::error::Unity ${VERSION} not installed at ${UNITY_PATH}. Install via Unity Hub on the runner machine."
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "path=$UNITY_PATH" >> $GITHUB_OUTPUT
+
+      - name: Read & validate project version
+        id: base_version
+        run: |
+          BASE=$(grep "^  bundleVersion:" ProjectSettings/ProjectSettings.asset | awk '{print $2}')
+          if ! echo "$BASE" | grep -qE '^[0-9]+\.[0-9]+$'; then
+            echo "::error::ProjectSettings bundleVersion must be X.Y format (got '$BASE')."
+            exit 1
+          fi
+          FULL="${BASE}.${{ github.run_number }}"
+          echo "base=$BASE" >> $GITHUB_OUTPUT
+          echo "full=$FULL" >> $GITHUB_OUTPUT
+
+      - name: Compute version code
+        id: version
+        run: |
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+
+      - name: Patch version in ProjectSettings
+        run: |
+          sed -i '' "s/^  bundleVersion: .*/  bundleVersion: ${{ steps.base_version.outputs.full }}/" ProjectSettings/ProjectSettings.asset
+          sed -i '' "/^  buildNumber:/,/^  [^[:space:]]/{s/^    iPhone: .*/    iPhone: \"${{ steps.version.outputs.code }}\"/;}" ProjectSettings/ProjectSettings.asset
+          echo "✓ bundleVersion         → ${{ steps.base_version.outputs.full }}"
+          echo "✓ buildNumber.iPhone    → ${{ steps.version.outputs.code }}"
+
+      - name: Build iOS (Xcode project export)
+        env:
+          UNITY_PATH: ${{ steps.unity.outputs.path }}
+        run: |
+          rm -rf build/iOS
+          flock /tmp/unity-mac-mini.lock \
+            "$UNITY_PATH" \
+              -batchmode \
+              -quit \
+              -nographics \
+              -projectPath "$GITHUB_WORKSPACE" \
+              -buildTarget iOS \
+              -executeMethod Builder.BuildIOS \
+              -logFile -
+
+      - name: Decode Apple credentials
+        env:
+          API_KEY_B64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          DIST_CERT_B64: ${{ secrets.APPLE_DIST_CERT_BASE64 }}
+          PROVISIONING_B64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          mkdir -p ci-certs
+          echo "$API_KEY_B64" | base64 -d > ci-certs/apple-api-key.p8
+          echo "$DIST_CERT_B64" | base64 -d > ci-certs/dist-cert.p12
+          echo "$PROVISIONING_B64" | base64 -d > ci-certs/profile.mobileprovision
+
+      # Build keychain may exist from a previous failed run — recreate fresh.
+      - name: Install Certificate into Keychain
+        env:
+          CERT_PASSWORD: ${{ secrets.APPLE_DIST_CERT_PASSWORD }}
+        run: |
+          security delete-keychain build.keychain 2>/dev/null || true
+          security create-keychain -p "" build.keychain
+          security list-keychain -d user -s build.keychain $(security list-keychain -d user | sed 's/"//g')
+          security set-keychain-settings -t 3600 -u build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import ci-certs/dist-cert.p12 \
+            -k build.keychain \
+            -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+
+      - name: Install Provisioning Profile
+        id: profile
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          security cms -D -i ci-certs/profile.mobileprovision > /tmp/profile.plist
+          PROFILE_UUID=$(plutil -extract UUID raw /tmp/profile.plist)
+          PROFILE_NAME=$(plutil -extract Name raw /tmp/profile.plist)
+          cp ci-certs/profile.mobileprovision \
+            ~/Library/MobileDevice/Provisioning\ Profiles/$PROFILE_UUID.mobileprovision
+          echo "profile_name=$PROFILE_NAME" >> $GITHUB_OUTPUT
+          echo "profile_uuid=$PROFILE_UUID" >> $GITHUB_OUTPUT
+
+      - name: Install CocoaPods (if Podfile exists)
+        id: pods
+        working-directory: build/iOS
+        run: |
+          if [ -f Podfile ]; then
+            pod install
+            echo "has_workspace=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_workspace=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Archive Xcode project
+        working-directory: build/iOS
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          IOS_SCHEME: ${{ vars.IOS_SCHEME }}
+          PROFILE_NAME: ${{ steps.profile.outputs.profile_name }}
+        run: |
+          rm -rf "${{ github.workspace }}/build/archive.xcarchive"
+          if [ "${{ steps.pods.outputs.has_workspace }}" = "true" ]; then
+            PROJECT_ARG="-workspace Unity-iPhone.xcworkspace"
+          else
+            PROJECT_ARG="-project Unity-iPhone.xcodeproj"
+          fi
+
+          xcodebuild $PROJECT_ARG \
+            -scheme "${IOS_SCHEME}" \
+            -configuration Release \
+            -archivePath "${{ github.workspace }}/build/archive.xcarchive" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" \
+            PROVISIONING_PROFILE_SPECIFIER="${PROFILE_NAME}" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            OTHER_CODE_SIGN_FLAGS="--keychain build.keychain" \
+            archive
+
+      - name: Export IPA
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          PROFILE_NAME: ${{ steps.profile.outputs.profile_name }}
+        run: |
+          rm -rf "${{ github.workspace }}/build/export"
+          cat > ci-certs/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${IOS_BUNDLE_ID}</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "${{ github.workspace }}/build/archive.xcarchive" \
+            -exportOptionsPlist ci-certs/ExportOptions.plist \
+            -exportPath "${{ github.workspace }}/build/export"
+
+      - name: Build ASC API key JSON
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          jq -n \
+            --arg key_id "${APPLE_API_KEY_ID}" \
+            --arg issuer_id "${APPLE_API_ISSUER_ID}" \
+            --rawfile key ci-certs/apple-api-key.p8 \
+            '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' \
+            > ci-certs/asc-api-key.json
+
+      - name: Upload to TestFlight
+        env:
+          TESTFLIGHT_GROUPS: ${{ vars.TESTFLIGHT_GROUPS }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          IPA_PATH=$(find "${{ github.workspace }}/build/export" -name "*.ipa" | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No .ipa file found in build/export/"
+            exit 1
+          fi
+          echo "Uploading: $IPA_PATH"
+
+          if [ -n "$TESTFLIGHT_GROUPS" ]; then
+            fastlane pilot upload \
+              --api_key_path ci-certs/asc-api-key.json \
+              --ipa "$IPA_PATH" \
+              --changelog "$RELEASE_NOTES" \
+              --distribute_external true \
+              --groups "$TESTFLIGHT_GROUPS" \
+              --skip_submission true \
+              --skip_waiting_for_build_processing true
+          else
+            fastlane pilot upload \
+              --api_key_path ci-certs/asc-api-key.json \
+              --ipa "$IPA_PATH" \
+              --changelog "$RELEASE_NOTES" \
+              --skip_submission true \
+              --skip_waiting_for_build_processing true
+          fi
+
+      # Always clean up — keychain, decoded secrets, and the installed
+      # provisioning profile. Build outputs are kept for debugging.
+      - name: Clean up
+        if: always()
+        run: |
+          security delete-keychain build.keychain 2>/dev/null || true
+          rm -rf ci-certs
+          if [ -n "${{ steps.profile.outputs.profile_uuid }}" ]; then
+            rm -f ~/Library/MobileDevice/Provisioning\ Profiles/${{ steps.profile.outputs.profile_uuid }}.mobileprovision || true
+          fi
