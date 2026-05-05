@@ -27,6 +27,14 @@ on:
         type: boolean
         required: false
         default: true
+      do_asana:
+        type: boolean
+        required: false
+        default: true
+      do_slack:
+        type: boolean
+        required: false
+        default: true
       release_notes:
         type: string
         required: false
