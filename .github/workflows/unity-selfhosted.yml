@@ -402,6 +402,16 @@ jobs:
             -exportPath "${{ github.workspace }}/build/export" \
             -allowProvisioningUpdates
 
+      # Upload the IPA as a workflow artifact so we can compare against
+      # a locally-built IPA when debugging Apple validation issues.
+      - name: Upload IPA artifact (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-${{ steps.base_version.outputs.code }}
+          path: build/export/*.ipa
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Build ASC API key JSON
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
