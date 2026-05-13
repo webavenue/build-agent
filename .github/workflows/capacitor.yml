@@ -368,6 +368,14 @@ jobs:
       - name: Run fastlane
         timeout-minutes: 30
         env:
+          # Gradle resolves Maven POMs from a long tail of ad-network mirrors (Mintegral,
+          # Pangle, Verve, BidMachine, PubMatic, Ogury, Chartboost). Any host with a stalled
+          # IPv6 route or no TCP response will pin the build forever. JAVA_TOOL_OPTIONS is
+          # picked up by the JVM at startup (every gradle daemon + worker), so preferIPv4Stack
+          # actually takes effect — setting it via gradle.properties does NOT, because Gradle
+          # converts -D system properties to runtime System.setProperty() calls, which is too
+          # late for class-init-time flags. sun.net.client.* bounds JVM-level URLConnections.
+          JAVA_TOOL_OPTIONS: "-Djava.net.preferIPv4Stack=true -Dsun.net.client.defaultConnectTimeout=15000 -Dsun.net.client.defaultReadTimeout=60000"
           APP_NAME: ${{ vars.APP_NAME }}
           ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
           ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/ci-certs/release.jks
