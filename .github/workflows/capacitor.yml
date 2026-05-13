@@ -556,8 +556,6 @@ jobs:
           FAILED_JOB_IDS=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
             --jq '.jobs[] | select(.conclusion=="failure") | .databaseId')
 
-          echo "DEBUG: failed job IDs = ${FAILED_JOB_IDS:-<none>}"
-
           if [ -z "$FAILED_JOB_IDS" ]; then
             echo "Could not identify failed job IDs — skipping AI analysis."
             exit 0
@@ -570,7 +568,6 @@ jobs:
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${REPO}/actions/jobs/${JOB_ID}/logs" \
               | tail -n 500 || true)
-            echo "DEBUG: job ${JOB_ID} log chars = ${#JOB_LOG}"
             if [ -n "$JOB_LOG" ]; then
               LOGS="${LOGS}"$'\n'"${JOB_LOG}"
             fi
