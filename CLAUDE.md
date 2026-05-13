@@ -47,7 +47,8 @@ Secrets/variables must be set on the **caller repo**, not this one. Use `push-se
 **Android:** `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_PASSWORD`, `GOOGLE_PLAY_JSON_KEY_BASE64`  
 **iOS:** `APPLE_API_KEY_BASE64`, `APPLE_DIST_CERT_BASE64`, `APPLE_DIST_CERT_PASSWORD`, `APPLE_PROVISIONING_PROFILE_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`  
 **App config (vars):** `APP_NAME`, `ANDROID_PACKAGE_NAME`, `IOS_BUNDLE_ID`, `IOS_SCHEME`, `GOOGLE_PLAY_TRACK`, `TESTFLIGHT_GROUPS`, `APPLE_TEAM_ID`  
-**Notifications:** `SLACK_BOT_TOKEN`, `ASANA_ACCESS_TOKEN`, `SLACK_CHANNEL_ID`, `ASANA_PROJECT_ID`, etc.
+**Notifications:** `SLACK_BOT_TOKEN`, `ASANA_ACCESS_TOKEN`, `SLACK_CHANNEL_ID`, `ASANA_PROJECT_ID`, etc.  
+**AI failure analysis (optional):** `ANTHROPIC_API_KEY` — when set, the notify job posts a plain-English diagnosis of build failures as a threaded Slack reply. Skipped silently if unset.
 
 ## push-secrets.sh
 
@@ -79,3 +80,4 @@ DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
 - **Keystore conversion:** Android job converts PKCS12 keystore → JKS before signing. This is required because older BouncyCastle versions in the Android Gradle Plugin can't parse PKCS12 keystores created with JDK 9+.
 - **Version code formula:** `version_code_offset + github.run_number`. Set different offsets per project to prevent collisions when multiple projects share the same workflow.
 - **Notifications:** After both Android and iOS jobs finish, a notify job creates Asana QA tasks and posts a Slack message with build status, download links, and release notes.
+- **Failure diagnosis:** On Android or iOS failure, the notify job pulls the failed-step logs via `gh run view --log-failed`, asks Claude Haiku 4.5 for a 2–4 sentence plain-English diagnosis, and posts it as a threaded reply to the Slack failure message. Requires `ANTHROPIC_API_KEY` on the caller repo; silently skipped if absent. Needs `actions: read` permission on the notify job (already declared).

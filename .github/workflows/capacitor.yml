@@ -307,6 +307,9 @@ jobs:
       (needs.android.result != 'skipped' || needs.ios.result != 'skipped') &&
       (inputs.do_slack || (inputs.do_asana && inputs.action == 'build + upload'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
 
     steps:
 
@@ -427,6 +430,7 @@ jobs:
           fi
 
       - name: Slack notification
+        id: slack
         if: always() && inputs.do_slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -501,11 +505,97 @@ jobs:
             MESSAGE="Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>"
           fi
 
-          curl -s -X POST "https://slack.com/api/chat.postMessage" \
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "{
               \"channel\": \"${SLACK_CHANNEL_ID}\",
               \"text\": \"${MESSAGE}\"
-            }" > /dev/null
-          echo "✓ Slack notification sent"
+            }")
+          TS=$(echo "$RESPONSE" | jq -r '.ts // empty')
+          echo "ts=${TS}" >> $GITHUB_OUTPUT
+          echo "✓ Slack notification sent (ts=${TS})"
+
+      # ─────────────────────────────────────────────────────────
+      # AI failure analysis — threaded reply on failure only.
+      # Pulls the failed step logs, asks Claude for a plain-English
+      # diagnosis, and posts it as a reply to the Slack message above.
+      # No-ops cleanly if ANTHROPIC_API_KEY isn't set on the caller repo.
+      # ─────────────────────────────────────────────────────────
+      - name: AI failure analysis (threaded reply)
+        if: >
+          always() && inputs.do_slack &&
+          (needs.android.result == 'failure' || needs.ios.result == 'failure') &&
+          steps.slack.outputs.ts != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          SLACK_TS: ${{ steps.slack.outputs.ts }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANDROID_RESULT: ${{ needs.android.result }}
+          IOS_RESULT: ${{ needs.ios.result }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "ANTHROPIC_API_KEY not configured on this repo — skipping AI analysis."
+            exit 0
+          fi
+
+          FAILED=""
+          [ "$ANDROID_RESULT" = "failure" ] && FAILED="Android"
+          [ "$IOS_RESULT" = "failure" ] && FAILED="${FAILED:+$FAILED + }iOS"
+
+          # Pull failed-step logs (last 500 lines, capped at ~30 KB)
+          LOGS=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null \
+            | tail -n 500 | tail -c 30000 || true)
+
+          if [ -z "$LOGS" ]; then
+            echo "No failed-step logs retrieved — skipping AI analysis."
+            exit 0
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg model "claude-haiku-4-5" \
+            --arg failed "$FAILED" \
+            --arg logs "$LOGS" \
+            '{
+              model: $model,
+              max_tokens: 400,
+              system: "You analyze GitHub Actions build-failure logs for a React + Capacitor app (Android via Gradle/Fastlane, iOS via Xcode/Fastlane). Your audience is non-developers on the project team. Reply in 2-4 short sentences: what failed, the most likely root cause (quote the actual error if visible), and one concrete next step. No code blocks, no headers, no preamble. If the cause is genuinely unclear from the logs, say so plainly.",
+              messages: [{
+                role: "user",
+                content: ("Platform(s) that failed: " + $failed + "\n\nTail of failed-step logs:\n\n" + $logs)
+              }]
+            }')
+
+          RESPONSE=$(curl -sS -X POST https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$PAYLOAD")
+
+          DIAGNOSIS=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+
+          if [ -z "$DIAGNOSIS" ]; then
+            echo "Claude returned no diagnosis. Raw response:"
+            echo "$RESPONSE"
+            exit 0
+          fi
+
+          TEXT=$':robot_face: *Likely cause:*\n'"$DIAGNOSIS"
+
+          REPLY=$(jq -n \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg thread_ts "$SLACK_TS" \
+            --arg text "$TEXT" \
+            '{channel: $channel, thread_ts: $thread_ts, text: $text}')
+
+          curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$REPLY" > /dev/null
+          echo "✓ AI diagnosis posted as threaded reply"
