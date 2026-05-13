@@ -310,7 +310,7 @@ jobs:
       (inputs.do_slack || (inputs.do_asana && inputs.action == 'build + upload'))
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # needed to create the post-build GitHub Release tag
       actions: read
 
     steps:
@@ -624,3 +624,47 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$REPLY" > /dev/null
           echo "✓ AI diagnosis posted as threaded reply"
+
+      # ─────────────────────────────────────────────────────────
+      # Tag successful build — creates a GitHub Release anchored
+      # at this commit SHA so the next build can diff against it
+      # to auto-generate a changelog.
+      #
+      # Only fires when:
+      #   • action is "build + upload" (build-only runs aren't shipped)
+      #   • every REQUESTED platform succeeded (skipped = not requested,
+      #     which is fine; failure or cancelled blocks the tag)
+      #   • at least one platform actually succeeded
+      #
+      # If the tag already exists (e.g. workflow re-run after a successful
+      # run), the step is a no-op rather than an error.
+      # ─────────────────────────────────────────────────────────
+      - name: Tag successful build
+        if: >
+          inputs.action == 'build + upload' &&
+          (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+          (needs.ios.result == 'success' || needs.ios.result == 'skipped') &&
+          (needs.android.result == 'success' || needs.ios.result == 'success')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          TAG="build-${{ github.run_number }}"
+          TITLE="Build ${{ github.run_number }} — v${VERSION_NAME} (${VERSION_CODE})"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping."
+            exit 0
+          fi
+
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "$TITLE" \
+            --notes "$RELEASE_NOTES" \
+            --prerelease
+
+          echo "✓ Tagged release: $TAG @ ${{ github.sha }}"
