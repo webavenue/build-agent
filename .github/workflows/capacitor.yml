@@ -653,8 +653,8 @@ jobs:
           set -euo pipefail
 
           VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
-          TAG="build-${{ github.run_number }}"
-          TITLE="Build ${{ github.run_number }} — v${VERSION_NAME} (${VERSION_CODE})"
+          TAG="build-${VERSION_CODE}"
+          TITLE="Build ${VERSION_CODE} — v${VERSION_NAME}"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists — skipping."
