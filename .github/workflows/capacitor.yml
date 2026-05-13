@@ -37,9 +37,15 @@ on:
         required: true
         default: '1.0.0'
       release_notes:
+        description: 'Fallback notes used when auto_changelog is false, or when auto-generation has nothing to say (first build, no new commits, API unreachable).'
         type: string
         required: false
         default: 'Bug fixes and performance improvements.'
+      auto_changelog:
+        description: 'When true, auto-generate release notes from commits since the last build tag using Claude. Falls back to release_notes on any failure.'
+        type: boolean
+        required: false
+        default: true
       version_code_offset:
         description: 'Added to github.run_number to produce the build/version code. Set per-project so codes never collide with previously uploaded builds.'
         type: number
@@ -52,10 +58,223 @@ on:
 jobs:
 
   # ───────────────────────────────────────────────────────────
+  # CHANGELOG — produces two outputs from commits since the
+  # last successful build tag:
+  #
+  #   notes     → polished, user-facing (Play Store, TestFlight)
+  #               2-5 bullets, ≤500 chars
+  #   qa_notes  → categorized, internal (Slack, Asana, GH Release)
+  #               sectioned by feature/improvement/fix/technical
+  #
+  # Fallback chain (any failure → use inputs.release_notes for
+  # BOTH outputs; partial failures use raw commits as the fallback
+  # for whichever LLM call failed):
+  #   • auto_changelog input is false
+  #   • No previous build-* release exists (first build)
+  #   • No commits between previous SHA and HEAD
+  #   • Previous SHA no longer reachable (force-pushed away)
+  #   • ANTHROPIC_API_KEY not set → raw commits for both
+  #   • A Claude API call fails → raw commits for that one
+  # ───────────────────────────────────────────────────────────
+  changelog:
+    name: Generate changelog
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      notes: ${{ steps.generate.outputs.notes }}
+      qa_notes: ${{ steps.generate.outputs.qa_notes }}
+      source: ${{ steps.generate.outputs.source }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history so we can diff against the previous build's SHA
+
+      - name: Generate
+        id: generate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          FALLBACK_NOTES: ${{ inputs.release_notes }}
+          AUTO_CHANGELOG: ${{ inputs.auto_changelog }}
+        run: |
+          set -uo pipefail
+
+          emit() {
+            # $1 = source label, $2 = user-facing notes, $3 = qa notes
+            echo "source=$1" >> "$GITHUB_OUTPUT"
+            {
+              echo "notes<<__NOTES_EOF__"
+              printf '%s\n' "$2"
+              echo "__NOTES_EOF__"
+              echo "qa_notes<<__QA_EOF__"
+              printf '%s\n' "$3"
+              echo "__QA_EOF__"
+            } >> "$GITHUB_OUTPUT"
+            echo "─── Changelog source: $1 ───"
+            echo "── User-facing notes (Play / TestFlight) ──"
+            printf '%s\n' "$2"
+            echo "── QA notes (Slack / Asana / GH Release) ──"
+            printf '%s\n' "$3"
+          }
+
+          call_claude() {
+            # $1 = system prompt, $2 = user message, $3 = max_tokens
+            # Echoes response text to stdout (empty string on failure).
+            local payload response text
+            payload=$(jq -n \
+              --arg model "claude-haiku-4-5" \
+              --arg system "$1" \
+              --arg content "$2" \
+              --argjson max_tokens "$3" \
+              '{
+                model: $model,
+                max_tokens: $max_tokens,
+                system: $system,
+                messages: [{ role: "user", content: $content }]
+              }')
+            response=$(curl -sS --max-time 30 -X POST https://api.anthropic.com/v1/messages \
+              -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "$payload" || echo "")
+            text=$(echo "$response" | jq -r '.content[0].text // empty' 2>/dev/null || echo "")
+            if [ -z "$text" ]; then
+              echo "⚠ Claude call returned empty. First 500 chars of response:" >&2
+              echo "$response" | head -c 500 >&2
+              echo >&2
+            fi
+            printf '%s' "$text"
+          }
+
+          if [ "$AUTO_CHANGELOG" != "true" ]; then
+            emit "fallback:auto_changelog=false" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          # Find the most recent build-* prerelease
+          PREV_TAG=$(gh release list --limit 100 \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.tagName | startswith("build-"))]
+                  | sort_by(.createdAt) | reverse
+                  | .[0].tagName // empty')
+
+          if [ -z "$PREV_TAG" ]; then
+            emit "fallback:no-previous-tag" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          PREV_SHA=$(gh release view "$PREV_TAG" \
+            --json targetCommitish --jq .targetCommitish 2>/dev/null || echo "")
+
+          if [ -z "$PREV_SHA" ] || ! git cat-file -e "$PREV_SHA" 2>/dev/null; then
+            emit "fallback:prev-sha-unreachable" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          # Collect commits since the previous build.
+          # %s = subject line — the only useful part for release notes.
+          COMMITS=$(git log "${PREV_SHA}..HEAD" --no-merges --pretty=format:"- %s")
+
+          if [ -z "$COMMITS" ]; then
+            emit "fallback:no-new-commits" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          echo "Commits since $PREV_TAG ($PREV_SHA):"
+          printf '%s\n' "$COMMITS"
+          echo "──────"
+
+          # Cap input at ~8 KB — protects against runaway PRs
+          COMMITS=$(printf '%s' "$COMMITS" | head -c 8000)
+
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            # No API key — ship raw commits for both. Better than nothing.
+            emit "raw-commits:no-api-key" "$COMMITS" "$COMMITS"
+            exit 0
+          fi
+
+          APP="${APP_NAME:-the app}"
+
+          # Build the user prompt (same shape for both LLM calls).
+          USER_MSG=$(printf '%s\n\n%s' "Commits since the last build:" "$COMMITS")
+
+          # ─── Call 1: user-facing release notes (Play / TestFlight) ───
+          # Prompt is assembled via printf so each line is a separate bash
+          # token — keeps the YAML block scalar's indentation rules happy
+          # while still producing a multi-line system prompt with real
+          # newlines for Claude.
+          USER_SYS=$(printf '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
+            "You write user-facing release notes for ${APP}. Input: git commit subjects. Output: 2-5 short bullets (under 400 chars total) summarising what end users will notice. Group related commits." \
+            "ORDER the bullets by user impact, most exciting first:" \
+            "  1. New features and content additions (e.g. \"Added daily reward chest\")" \
+            "  2. Improvements and changes to existing features (e.g. \"Faster loading on the home screen\")" \
+            "  3. Bug fixes and crash fixes (e.g. \"Fixed crash when opening settings\")" \
+            "Drop chore/refactor/test/build/ci/wip commits entirely — they are not user-facing. If commits are too vague or unparseable (e.g. all \"wip\" / \"fix\"), reply with exactly: Bug fixes and performance improvements. No headers, no preamble, no markdown other than \"- \" bullets, no trailing commentary.")
+
+          NOTES=$(call_claude "$USER_SYS" "$USER_MSG" 400)
+
+          # Enforce Play Store's 500-char limit.
+          if [ -n "$NOTES" ] && [ ${#NOTES} -gt 500 ]; then
+            echo "⚠ User-facing output was ${#NOTES} chars (Play limit: 500). Asking Claude to shorten."
+            SHORTEN_MSG=$(printf '%s\n\n%s\n%s' \
+              "Shorten these release notes to UNDER 450 characters total. Keep the same \"- \" bullet format. Drop the least-important items if needed. Output only the bullets — no preamble, no headers." \
+              "Current notes:" \
+              "$NOTES")
+            SHORTENED=$(call_claude "" "$SHORTEN_MSG" 300)
+            if [ -n "$SHORTENED" ] && [ ${#SHORTENED} -lt ${#NOTES} ]; then
+              echo "✓ Shortened to ${#SHORTENED} chars"
+              NOTES="$SHORTENED"
+            else
+              echo "⚠ Retry didn't produce shorter notes — relying on hard truncate"
+            fi
+          fi
+
+          # Hard safety net: truncate to 480 chars, snap to last newline.
+          if [ -n "$NOTES" ] && [ ${#NOTES} -gt 500 ]; then
+            ORIGINAL_LEN=${#NOTES}
+            TRUNCATED=$(printf '%s' "$NOTES" | head -c 480)
+            TRUNCATED="${TRUNCATED%$'\n'*}"
+            NOTES="$TRUNCATED"
+            echo "⚠ Hard-truncated from ${ORIGINAL_LEN} → ${#NOTES} chars"
+          fi
+
+          # ─── Call 2: QA notes (Slack / Asana / GH Release body) ───
+          QA_SYS=$(printf '%s\n\n%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n%s\n\n%s' \
+            "You write internal release notes for a QA team that will test a mobile app build for ${APP}. Input: git commit subjects." \
+            "Output: a categorized list grouped by section. Use these section headers EXACTLY (emoji + uppercase), in this order, omitting any section that has no entries:" \
+            "🎯 NEW FEATURES" \
+            "- Each new feature on its own bullet, with a short hint about what to verify" \
+            "✨ IMPROVEMENTS" \
+            "- Each change to existing features — what surfaces are affected" \
+            "🐛 BUG FIXES" \
+            "- Each fix — scenario QA should reproduce or verify" \
+            "🔧 TECHNICAL" \
+            "- Refactors, dependency bumps, or infrastructure changes that COULD affect runtime behaviour (touch UI, change SDKs, etc.). Skip if none apply." \
+            "Drop purely internal commits (CI config edits, doc-only, formatting, comments). Each bullet should briefly say what changed PLUS a short testing hint. Aim for under 1500 characters total. Plain text — no markdown bold/italic, just \"- \" bullets and the section headers exactly as shown.")
+
+          QA_NOTES=$(call_claude "$QA_SYS" "$USER_MSG" 800)
+
+          # Decide source label based on which calls succeeded.
+          if [ -z "$NOTES" ] && [ -z "$QA_NOTES" ]; then
+            emit "raw-commits:llm-failed" "$COMMITS" "$COMMITS"
+          elif [ -z "$NOTES" ]; then
+            emit "partial:user-llm-failed" "$COMMITS" "$QA_NOTES"
+          elif [ -z "$QA_NOTES" ]; then
+            emit "partial:qa-llm-failed" "$NOTES" "$COMMITS"
+          else
+            emit "llm-generated" "$NOTES" "$QA_NOTES"
+          fi
+
+  # ───────────────────────────────────────────────────────────
   # ANDROID
   # ───────────────────────────────────────────────────────────
   android:
     name: Build & Upload Android
+    needs: changelog
     if: ${{ inputs.build_android }}
     runs-on: ubuntu-latest
 
@@ -136,14 +355,15 @@ jobs:
         run: npx cap sync android
 
       - name: Write release notes
+        env:
+          NOTES: ${{ needs.changelog.outputs.notes }}
         run: |
           mkdir -p fastlane/metadata/android/en-US/changelogs
-          NOTES="${{ inputs.release_notes }}"
           if [ -z "$NOTES" ]; then
             NOTES="Bug fixes and performance improvements."
           fi
-          echo "$NOTES" > fastlane/metadata/android/en-US/changelogs/${{ steps.version.outputs.code }}.txt
-          echo "✓ Release notes written"
+          printf '%s\n' "$NOTES" > fastlane/metadata/android/en-US/changelogs/${{ steps.version.outputs.code }}.txt
+          echo "✓ Release notes written (source: ${{ needs.changelog.outputs.source }})"
 
       - name: Run fastlane
         env:
@@ -179,6 +399,7 @@ jobs:
   # ───────────────────────────────────────────────────────────
   ios:
     name: Build & Upload iOS
+    needs: changelog
     if: ${{ inputs.build_ios && inputs.action == 'build + upload' }}
     runs-on: macos-15
 
@@ -291,7 +512,7 @@ jobs:
           IOS_PROVISIONING_PROFILE_NAME: ${{ steps.profile.outputs.profile_name }}
           VERSION_NAME: ${{ inputs.version_name }}
           VERSION_CODE: ${{ steps.version.outputs.code }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.notes }}
           CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
         run: bundle exec fastlane ios ship
 
@@ -301,7 +522,7 @@ jobs:
   # ───────────────────────────────────────────────────────────
   notify:
     name: Notify
-    needs: [android, ios]
+    needs: [changelog, android, ios]
     # !cancelled() runs in every case except a manual workflow cancellation —
     # so cancelled runs stay quiet, but failures and successes still notify.
     if: >
@@ -310,7 +531,7 @@ jobs:
       (inputs.do_slack || (inputs.do_asana && inputs.action == 'build + upload'))
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # needed to create the post-build GitHub Release tag
       actions: read
 
     steps:
@@ -326,30 +547,37 @@ jobs:
           ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
           ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
           VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
           BRANCH: ${{ github.ref_name }}
         run: |
           VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
           TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [Android] ${VERSION_CODE}(${VERSION_NAME}) QA"
           echo "Creating Asana task: $TASK_NAME"
 
-          if [ -n "$ASANA_PROJECT_ID" ]; then
-            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
-          else
-            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
-          fi
+          # Build the Asana request body with jq so newlines / quotes / unicode
+          # in RELEASE_NOTES are escaped correctly. The previous string-concat
+          # approach broke as soon as RELEASE_NOTES contained real newlines.
+          NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+
+          REQUEST=$(jq -n \
+            --arg name "$TASK_NAME" \
+            --arg notes "$NOTES_BODY" \
+            --arg qa_project "$ASANA_QA_PROJECT_ID" \
+            --arg extra_project "$ASANA_PROJECT_ID" \
+            --arg assignee "$ASANA_ASSIGNEE_ID" \
+            '{
+              data: {
+                name: $name,
+                notes: $notes,
+                projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
+                assignee: $assignee
+              }
+            }')
 
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"data\": {
-                \"name\": \"${TASK_NAME}\",
-                \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
-                \"projects\": ${PROJECTS},
-                \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
-              }
-            }")
+            -d "$REQUEST")
 
           echo "Asana response: $TASK_RESPONSE"
           TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
@@ -384,30 +612,34 @@ jobs:
           ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
           ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
           VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
           BRANCH: ${{ github.ref_name }}
         run: |
           VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
           TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [iOS] ${VERSION_CODE}(${VERSION_NAME}) QA"
           echo "Creating Asana task: $TASK_NAME"
 
-          if [ -n "$ASANA_PROJECT_ID" ]; then
-            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
-          else
-            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
-          fi
+          NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+
+          REQUEST=$(jq -n \
+            --arg name "$TASK_NAME" \
+            --arg notes "$NOTES_BODY" \
+            --arg qa_project "$ASANA_QA_PROJECT_ID" \
+            --arg extra_project "$ASANA_PROJECT_ID" \
+            --arg assignee "$ASANA_ASSIGNEE_ID" \
+            '{
+              data: {
+                name: $name,
+                notes: $notes,
+                projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
+                assignee: $assignee
+              }
+            }')
 
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"data\": {
-                \"name\": \"${TASK_NAME}\",
-                \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
-                \"projects\": ${PROJECTS},
-                \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
-              }
-            }")
+            -d "$REQUEST")
 
           echo "Asana response: $TASK_RESPONSE"
           TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
@@ -440,7 +672,7 @@ jobs:
           SLACK_ANDROID_DOWNLOAD_URL: ${{ vars.SLACK_ANDROID_DOWNLOAD_URL }}
           APP_NAME: ${{ vars.APP_NAME }}
           VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
           BRANCH: ${{ github.ref_name }}
           ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
           IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
@@ -477,43 +709,48 @@ jobs:
             fi
           fi
 
+          # Build the message with REAL newlines (printf %b decodes the \n
+          # escapes) so jq below can serialize it as proper JSON. The old
+          # template embedded \n literals + interpolated them into hand-rolled
+          # JSON, which broke as soon as RELEASE_NOTES contained newlines.
           if [ "$ALL_SUCCESS" = "true" ]; then
             if [ "$ACTION" = "build only" ]; then
-              MESSAGE="Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n• ${RELEASE_NOTES}"
-              MESSAGE="${MESSAGE}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_"
+              MESSAGE=$(printf '%b' "Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_")
             else
-              MESSAGE="Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n• ${RELEASE_NOTES}"
+              MESSAGE=$(printf '%b' "Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}")
 
               if [ "$ANDROID_RESULT" = "success" ]; then
-                ANDROID_LINE="\n\n:robot_face: Android → Play Store internal track"
                 if [ -n "$SLACK_ANDROID_DOWNLOAD_URL" ]; then
-                  ANDROID_LINE="${ANDROID_LINE} | <${SLACK_ANDROID_DOWNLOAD_URL}|Download>"
+                  MESSAGE=$(printf '%b' "${MESSAGE}\n\n:robot_face: Android → Play Store internal track | <${SLACK_ANDROID_DOWNLOAD_URL}|Download>")
+                else
+                  MESSAGE=$(printf '%b' "${MESSAGE}\n\n:robot_face: Android → Play Store internal track")
                 fi
-                MESSAGE="${MESSAGE}${ANDROID_LINE}"
               fi
 
               if [ "$IOS_RESULT" = "success" ]; then
-                MESSAGE="${MESSAGE}\n:apple: iOS → TestFlight"
+                MESSAGE=$(printf '%b' "${MESSAGE}\n:apple: iOS → TestFlight")
               fi
 
               if [ -n "$ANDROID_TASK_URL" ]; then
-                MESSAGE="${MESSAGE}\n:pushpin: Android QA: <${ANDROID_TASK_URL}|View task>"
+                MESSAGE=$(printf '%b' "${MESSAGE}\n:pushpin: Android QA: <${ANDROID_TASK_URL}|View task>")
               fi
               if [ -n "$IOS_TASK_URL" ]; then
-                MESSAGE="${MESSAGE}\n:pushpin: iOS QA: <${IOS_TASK_URL}|View task>"
+                MESSAGE=$(printf '%b' "${MESSAGE}\n:pushpin: iOS QA: <${IOS_TASK_URL}|View task>")
               fi
             fi
           else
-            MESSAGE="Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>"
+            MESSAGE=$(printf '%b' "Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>")
           fi
+
+          REQUEST=$(jq -n \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg text "$MESSAGE" \
+            '{channel: $channel, text: $text}')
 
           RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"channel\": \"${SLACK_CHANNEL_ID}\",
-              \"text\": \"${MESSAGE}\"
-            }")
+            -d "$REQUEST")
           TS=$(echo "$RESPONSE" | jq -r '.ts // empty')
           echo "ts=${TS}" >> $GITHUB_OUTPUT
           echo "✓ Slack notification sent (ts=${TS})"
@@ -624,3 +861,53 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$REPLY" > /dev/null
           echo "✓ AI diagnosis posted as threaded reply"
+
+      # ─────────────────────────────────────────────────────────
+      # Tag successful build — creates a GitHub Release anchored
+      # at this commit SHA so the next build can diff against it
+      # to auto-generate a changelog.
+      #
+      # Only fires when:
+      #   • action is "build + upload" (build-only runs aren't shipped)
+      #   • every REQUESTED platform succeeded (skipped = not requested,
+      #     which is fine; failure or cancelled blocks the tag)
+      #   • at least one platform actually succeeded
+      #
+      # If the tag already exists (e.g. workflow re-run after a successful
+      # run), the step is a no-op rather than an error.
+      # ─────────────────────────────────────────────────────────
+      - name: Tag successful build
+        if: >
+          inputs.action == 'build + upload' &&
+          (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+          (needs.ios.result == 'success' || needs.ios.result == 'skipped') &&
+          (needs.android.result == 'success' || needs.ios.result == 'success')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          # GitHub Release body uses the detailed QA notes — same content
+          # the QA team sees in Slack/Asana, so this becomes a browsable
+          # archive of every build's testing scope.
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          TAG="build-${VERSION_CODE}"
+          TITLE="Build ${VERSION_CODE} — v${VERSION_NAME}"
+
+          # GH_REPO env var tells gh which repo to operate on without needing
+          # a local git checkout (this job never checks out the source).
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping."
+            exit 0
+          fi
+
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "$TITLE" \
+            --notes "$RELEASE_NOTES" \
+            --prerelease
+
+          echo "✓ Tagged release: $TAG @ ${{ github.sha }}"
