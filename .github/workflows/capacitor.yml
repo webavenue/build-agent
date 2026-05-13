@@ -37,9 +37,15 @@ on:
         required: true
         default: '1.0.0'
       release_notes:
+        description: 'Fallback notes used when auto_changelog is false, or when auto-generation has nothing to say (first build, no new commits, API unreachable).'
         type: string
         required: false
         default: 'Bug fixes and performance improvements.'
+      auto_changelog:
+        description: 'When true, auto-generate release notes from commits since the last build tag using Claude. Falls back to release_notes on any failure.'
+        type: boolean
+        required: false
+        default: true
       version_code_offset:
         description: 'Added to github.run_number to produce the build/version code. Set per-project so codes never collide with previously uploaded builds.'
         type: number
@@ -52,10 +58,142 @@ on:
 jobs:
 
   # ───────────────────────────────────────────────────────────
+  # CHANGELOG — auto-generates user-facing release notes from
+  # commits since the last successful build tag. Output is
+  # consumed by android, ios, and notify jobs.
+  #
+  # Fallback chain (any failure → use inputs.release_notes):
+  #   • auto_changelog input is false
+  #   • No previous build-* release exists (first build)
+  #   • No commits between previous SHA and HEAD
+  #   • Previous SHA no longer reachable (force-pushed away)
+  #   • ANTHROPIC_API_KEY not set → use raw commit list
+  #   • Claude API call fails → use raw commit list
+  # ───────────────────────────────────────────────────────────
+  changelog:
+    name: Generate changelog
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      notes: ${{ steps.generate.outputs.notes }}
+      source: ${{ steps.generate.outputs.source }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history so we can diff against the previous build's SHA
+
+      - name: Generate
+        id: generate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          FALLBACK_NOTES: ${{ inputs.release_notes }}
+          AUTO_CHANGELOG: ${{ inputs.auto_changelog }}
+        run: |
+          set -uo pipefail
+
+          emit() {
+            # $1 = source label, $2 = notes body
+            echo "source=$1" >> "$GITHUB_OUTPUT"
+            {
+              echo "notes<<__NOTES_EOF__"
+              printf '%s\n' "$2"
+              echo "__NOTES_EOF__"
+            } >> "$GITHUB_OUTPUT"
+            echo "─── Changelog source: $1 ───"
+            printf '%s\n' "$2"
+          }
+
+          if [ "$AUTO_CHANGELOG" != "true" ]; then
+            emit "fallback:auto_changelog=false" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          # Find the most recent build-* prerelease
+          PREV_TAG=$(gh release list --limit 100 \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.tagName | startswith("build-"))]
+                  | sort_by(.createdAt) | reverse
+                  | .[0].tagName // empty')
+
+          if [ -z "$PREV_TAG" ]; then
+            emit "fallback:no-previous-tag" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          PREV_SHA=$(gh release view "$PREV_TAG" \
+            --json targetCommitish --jq .targetCommitish 2>/dev/null || echo "")
+
+          if [ -z "$PREV_SHA" ] || ! git cat-file -e "$PREV_SHA" 2>/dev/null; then
+            emit "fallback:prev-sha-unreachable" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          # Collect commits since the previous build.
+          # %s = subject line — the only useful part for release notes.
+          # %an excluded to keep input compact for the LLM.
+          COMMITS=$(git log "${PREV_SHA}..HEAD" --no-merges --pretty=format:"- %s")
+
+          if [ -z "$COMMITS" ]; then
+            emit "fallback:no-new-commits" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          echo "Commits since $PREV_TAG ($PREV_SHA):"
+          printf '%s\n' "$COMMITS"
+          echo "──────"
+
+          # Cap input at ~8 KB — protects against runaway PRs
+          COMMITS=$(printf '%s' "$COMMITS" | head -c 8000)
+
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            # No API key — ship raw commits. Better than nothing, and the
+            # team can read commit subjects fine.
+            emit "raw-commits:no-api-key" "$COMMITS"
+            exit 0
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg model "claude-haiku-4-5" \
+            --arg app "${APP_NAME:-the app}" \
+            --arg commits "$COMMITS" \
+            '{
+              model: $model,
+              max_tokens: 400,
+              system: ("You write user-facing release notes for " + $app + ". Input: git commit subjects. Output: 2-5 short bullets (under 400 chars total) summarising what end users will notice. Group related commits. Drop chore/refactor/test/build/ci/wip commits entirely — they are not user-facing. If commits are too vague or unparseable (e.g. all \"wip\" / \"fix\"), reply with exactly: Bug fixes and performance improvements. No headers, no preamble, no markdown other than \"- \" bullets, no trailing commentary."),
+              messages: [{
+                role: "user",
+                content: ("Commits since the last build:\n\n" + $commits)
+              }]
+            }')
+
+          RESPONSE=$(curl -sS --max-time 30 -X POST https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$PAYLOAD" || echo "")
+
+          NOTES=$(echo "$RESPONSE" | jq -r '.content[0].text // empty' 2>/dev/null || echo "")
+
+          if [ -z "$NOTES" ]; then
+            echo "Claude returned no content. Raw response:"
+            echo "$RESPONSE" | head -c 500
+            emit "raw-commits:llm-failed" "$COMMITS"
+            exit 0
+          fi
+
+          emit "llm-generated" "$NOTES"
+
+  # ───────────────────────────────────────────────────────────
   # ANDROID
   # ───────────────────────────────────────────────────────────
   android:
     name: Build & Upload Android
+    needs: changelog
     if: ${{ inputs.build_android }}
     runs-on: ubuntu-latest
 
@@ -136,14 +274,15 @@ jobs:
         run: npx cap sync android
 
       - name: Write release notes
+        env:
+          NOTES: ${{ needs.changelog.outputs.notes }}
         run: |
           mkdir -p fastlane/metadata/android/en-US/changelogs
-          NOTES="${{ inputs.release_notes }}"
           if [ -z "$NOTES" ]; then
             NOTES="Bug fixes and performance improvements."
           fi
-          echo "$NOTES" > fastlane/metadata/android/en-US/changelogs/${{ steps.version.outputs.code }}.txt
-          echo "✓ Release notes written"
+          printf '%s\n' "$NOTES" > fastlane/metadata/android/en-US/changelogs/${{ steps.version.outputs.code }}.txt
+          echo "✓ Release notes written (source: ${{ needs.changelog.outputs.source }})"
 
       - name: Run fastlane
         env:
@@ -179,6 +318,7 @@ jobs:
   # ───────────────────────────────────────────────────────────
   ios:
     name: Build & Upload iOS
+    needs: changelog
     if: ${{ inputs.build_ios && inputs.action == 'build + upload' }}
     runs-on: macos-15
 
@@ -291,7 +431,7 @@ jobs:
           IOS_PROVISIONING_PROFILE_NAME: ${{ steps.profile.outputs.profile_name }}
           VERSION_NAME: ${{ inputs.version_name }}
           VERSION_CODE: ${{ steps.version.outputs.code }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.notes }}
           CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
         run: bundle exec fastlane ios ship
 
@@ -301,7 +441,7 @@ jobs:
   # ───────────────────────────────────────────────────────────
   notify:
     name: Notify
-    needs: [android, ios]
+    needs: [changelog, android, ios]
     # !cancelled() runs in every case except a manual workflow cancellation —
     # so cancelled runs stay quiet, but failures and successes still notify.
     if: >
@@ -326,7 +466,7 @@ jobs:
           ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
           ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
           VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.notes }}
           BRANCH: ${{ github.ref_name }}
         run: |
           VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
@@ -384,7 +524,7 @@ jobs:
           ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
           ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
           VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.notes }}
           BRANCH: ${{ github.ref_name }}
         run: |
           VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
@@ -440,7 +580,7 @@ jobs:
           SLACK_ANDROID_DOWNLOAD_URL: ${{ vars.SLACK_ANDROID_DOWNLOAD_URL }}
           APP_NAME: ${{ vars.APP_NAME }}
           VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.notes }}
           BRANCH: ${{ github.ref_name }}
           ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
           IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
@@ -649,7 +789,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           VERSION_NAME: ${{ inputs.version_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.notes }}
         run: |
           set -euo pipefail
 
