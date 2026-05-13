@@ -549,9 +549,28 @@ jobs:
           [ "$ANDROID_RESULT" = "failure" ] && FAILED="Android"
           [ "$IOS_RESULT" = "failure" ] && FAILED="${FAILED:+$FAILED + }iOS"
 
-          # Pull failed-step logs (last 500 lines, capped at ~30 KB)
-          LOGS=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null \
-            | tail -n 500 | tail -c 30000 || true)
+          # The /runs/{id}/logs endpoint only returns logs after the whole
+          # workflow finishes, so we can't use it from inside notify. Fetch
+          # per-job logs instead — those are available as soon as each job
+          # completes.
+          FAILED_JOB_IDS=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+            --jq '.jobs[] | select(.conclusion=="failure") | .databaseId')
+
+          if [ -z "$FAILED_JOB_IDS" ]; then
+            echo "Could not identify failed job IDs — skipping AI analysis."
+            exit 0
+          fi
+
+          LOGS=""
+          for JOB_ID in $FAILED_JOB_IDS; do
+            JOB_LOG=$(gh run view --repo "$REPO" --job "$JOB_ID" --log-failed | tail -n 500 || true)
+            if [ -n "$JOB_LOG" ]; then
+              LOGS="${LOGS}"$'\n'"${JOB_LOG}"
+            fi
+          done
+
+          # Cap total payload at ~30 KB
+          LOGS=$(echo "$LOGS" | tail -c 30000)
 
           if [ -z "$LOGS" ]; then
             echo "No failed-step logs retrieved — skipping AI analysis."
