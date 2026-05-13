@@ -16,7 +16,9 @@ compatibility_date = "2025-05-01"
 
 [vars]
 WORKFLOW_FILE = "build.yml"
-DEFAULT_REF = "main"
+# Default branch used when /build is invoked without a 3rd arg.
+# Override per-command with: /build android 1.2.3 main
+DEFAULT_REF = "develop"
 
 [observability]
 enabled = true

@@ -69,10 +69,11 @@ export default {
       version_name: parsed.version,
     };
 
+    const ref = parsed.ref ?? env.DEFAULT_REF;
     const dispatch = await dispatchWorkflow(
       repo,
       env.WORKFLOW_FILE,
-      env.DEFAULT_REF,
+      ref,
       inputs,
       env.GITHUB_TOKEN,
     );
@@ -89,7 +90,7 @@ export default {
     const actionsUrl = `https://github.com/${repo}/actions/workflows/${env.WORKFLOW_FILE}`;
 
     return slackReply(
-      `:rocket: <@${userId}> kicked off a *${platformLabel}* build of \`${repo}\` — v${parsed.version}. <${actionsUrl}|Watch the run>`,
+      `:rocket: <@${userId}> kicked off a *${platformLabel}* build of \`${repo}\` (\`${ref}\`) — v${parsed.version}. <${actionsUrl}|Watch the run>`,
       "in_channel",
     );
   },
@@ -100,12 +101,12 @@ export default {
 // ─────────────────────────────────────────────────────────────
 
 type ParsedArgs =
-  | { android: boolean; ios: boolean; version: string }
+  | { android: boolean; ios: boolean; version: string; ref?: string }
   | { error: string };
 
 function parseArgs(text: string): ParsedArgs {
   const usage =
-    "Usage: `/build <android|ios|both> <version>` — e.g. `/build android 1.2.3`";
+    "Usage: `/build <android|ios|both> <version> [branch]` — e.g. `/build android 1.2.3` or `/build ios 1.2.3 feature/login`";
 
   const tokens = text.split(/\s+/).filter(Boolean);
   if (tokens.length < 2) return { error: `:x: Missing arguments. ${usage}` };
@@ -126,10 +127,21 @@ function parseArgs(text: string): ParsedArgs {
     return { error: `:x: Version must look like \`1.2.3\` — got \`${version}\`. ${usage}` };
   }
 
+  let ref: string | undefined;
+  if (tokens.length >= 3) {
+    ref = tokens[2];
+    // Loose git-ref check: rejects spaces, quotes, and shell metachars while
+    // allowing normal branch names like feature/foo, release-1.2, v1.2.3.
+    if (!/^[A-Za-z0-9._\/-]+$/.test(ref) || ref.length > 200) {
+      return { error: `:x: Branch \`${ref}\` doesn't look like a valid git ref.` };
+    }
+  }
+
   return {
     android: platform === "android" || platform === "both",
     ios: platform === "ios" || platform === "both",
     version,
+    ref,
   };
 }
 
