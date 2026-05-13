@@ -164,7 +164,7 @@ jobs:
             '{
               model: $model,
               max_tokens: 400,
-              system: ("You write user-facing release notes for " + $app + ". Input: git commit subjects. Output: 2-5 short bullets (under 400 chars total) summarising what end users will notice. Group related commits. Drop chore/refactor/test/build/ci/wip commits entirely — they are not user-facing. If commits are too vague or unparseable (e.g. all \"wip\" / \"fix\"), reply with exactly: Bug fixes and performance improvements. No headers, no preamble, no markdown other than \"- \" bullets, no trailing commentary."),
+              system: ("You write user-facing release notes for " + $app + ". Input: git commit subjects. Output: 2-5 short bullets (under 400 chars total) summarising what end users will notice. Group related commits.\n\nORDER the bullets by user impact, most exciting first:\n  1. New features and content additions (e.g. \"Added daily reward chest\")\n  2. Improvements and changes to existing features (e.g. \"Faster loading on the home screen\")\n  3. Bug fixes and crash fixes (e.g. \"Fixed crash when opening settings\")\n\nDrop chore/refactor/test/build/ci/wip commits entirely — they are not user-facing. If commits are too vague or unparseable (e.g. all \"wip\" / \"fix\"), reply with exactly: Bug fixes and performance improvements. No headers, no preamble, no markdown other than \"- \" bullets, no trailing commentary."),
               messages: [{
                 role: "user",
                 content: ("Commits since the last build:\n\n" + $commits)
