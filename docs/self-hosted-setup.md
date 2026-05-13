@@ -1,14 +1,16 @@
 # Self-Hosted Mac Runner Setup
 
-Step-by-step guide to set up a Mac mini as a self-hosted GitHub Actions runner for `capacitor-selfhosted.yml`.
+Step-by-step guide to use a Mac mini as a self-hosted GitHub Actions runner for `capacitor-selfhosted.yml`.
 
-One Mac mini hosts one runner that builds both Android and iOS sequentially (Android first, then iOS). The runner is shared across all caller repos that opt into the self-hosted workflow.
+**Setup model:** repo-scoped runners. One runner instance per caller repo, all running side-by-side on the same Mac mini. Each runner picks up jobs only from its registered repo, so caller repos stay isolated. This is the right pattern for personal/free GitHub accounts where org-level runners aren't available (or where org features aren't worth the GitHub Team upgrade).
+
+A second Capacitor caller repo? Repeat the runner-install steps in §3, change the directory name + repo URL. Both runners coexist on the same Mac mini.
 
 ---
 
 ## 1. Required host tools
 
-Install these on the Mac mini before configuring the runner.
+Install these on the Mac mini once. Subsequent runners on the same machine reuse them.
 
 | Tool | Required | Verify with | Install |
 |---|---|---|---|
@@ -21,18 +23,16 @@ Install these on the Mac mini before configuring the runner.
 | CocoaPods | 1.16.2 | `pod --version` | `gem install cocoapods -v 1.16.2` |
 | Homebrew | 4+ | `brew --version` | https://brew.sh |
 
-After installing Ruby via Homebrew, ensure the Homebrew Ruby is on PATH ahead of the system Ruby:
+If `java -version` shows 21 but `$JAVA_HOME` is empty, set it permanently:
 
 ```bash
-echo 'export PATH="/opt/homebrew/opt/ruby/bin:$PATH"' >> ~/.zshrc
+echo 'export JAVA_HOME=$(/usr/libexec/java_home -v 21)' >> ~/.zshrc
 source ~/.zshrc
 ```
 
 ## 2. iOS signing prerequisites
 
 The `capacitor-selfhosted.yml` iOS job uses **automatic signing** with `xcodebuild -allowProvisioningUpdates` + the App Store Connect API key. Profiles are fetched at build time; no `.mobileprovision` is decoded from secrets.
-
-Two things must be set up on the Mac mini:
 
 ### 2a. Apple Distribution certificate in the login keychain
 
@@ -42,54 +42,98 @@ Verify it's there:
 security find-identity -v -p codesigning
 ```
 
-You should see at least one `Apple Distribution: <Company Name> (<TEAM_ID>)` entry. If you develop locally on this Mac, it's likely already installed. Otherwise, export the `.p12` from another Mac (Keychain Access → My Certificates → right-click → Export), copy it over, and double-click to import.
+You should see at least one `Apple Distribution: <Company Name> (<TEAM_ID>)` entry. If you develop locally on this Mac, it's likely already installed. Otherwise export the `.p12` from another Mac (Keychain Access → My Certificates → right-click → Export), copy it over, and double-click to import.
 
-### 2b. Apple ID signed into Xcode (recommended fallback)
+### 2b. Apple ID signed into Xcode (recommended)
 
-Open Xcode → Settings → Accounts → add your Apple ID. With the App Store Connect API key, this isn't strictly required, but having it logged in helps when Xcode needs to refresh profiles outside of CI.
+Open Xcode → Settings → Accounts → add your Apple ID. With the App Store Connect API key, this isn't strictly required for CI, but having it logged in helps when Xcode needs to refresh profiles outside of CI.
 
-## 3. Install the GitHub Actions runner
+## 3. Install a runner for one caller repo
 
-GitHub gives you the exact commands when you add a new runner. For each repo (or, better, at the organization level), go to:
+Repeat this section for each caller repo that wants to use the self-hosted workflow.
 
-**Settings → Actions → Runners → New self-hosted runner → macOS → ARM64**
+The convention on this Mac mini is one directory per repo, all under `~/actions-runners/`:
 
-Follow the on-screen instructions, which look roughly like:
+```
+/Users/ava/actions-runners/
+├── Golf/              # webavenue/GolfTycoon (Unity)
+├── DotCollector2/     # webavenue/Dot-Collector-Idle-2 (Capacitor)
+└── <next-repo>/       # ...
+```
+
+### Step 3a. Get the registration token
+
+In the browser, go to the caller repo's runner page:
+
+```
+https://github.com/<owner>/<repo>/settings/actions/runners/new
+```
+
+- Runner image: **macOS**
+- Architecture: **ARM64**
+
+GitHub shows a set of commands — **copy just the token** from the `./config.sh --token <TOKEN>` line. Tokens are single-use and expire in 1 hour, so generate fresh if you don't use it immediately.
+
+Also note the **runner version** in the URL of the download command (e.g. `v2.328.0`).
+
+### Step 3b. Download + extract the runner on the Mac mini
 
 ```bash
-mkdir ~/actions-runner && cd ~/actions-runner
-curl -o actions-runner-osx-arm64.tar.gz -L https://github.com/actions/runner/releases/download/v2.XXX.X/actions-runner-osx-arm64-2.XXX.X.tar.gz
-tar xzf ./actions-runner-osx-arm64.tar.gz
-./config.sh --url https://github.com/<org-or-user> --token <token>
+# Replace <repo-shortname> with a folder name for this repo (e.g. DotCollector2)
+mkdir -p /Users/ava/actions-runners/<repo-shortname>
+cd /Users/ava/actions-runners/<repo-shortname>
+
+# Use the version GitHub showed you
+RUNNER_VERSION="2.328.0"
+curl -o actions-runner.tar.gz -L \
+  https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz
+tar xzf actions-runner.tar.gz
+rm actions-runner.tar.gz
 ```
 
-When `config.sh` asks for **labels**, enter (in addition to the defaults):
+### Step 3c. Configure — pin to this caller repo
 
-```
-self-hosted,macOS,ARM64
-```
-
-These three labels are required — the workflow targets `runs-on: [self-hosted, macOS, ARM64]`. If you skip them, jobs will queue forever waiting for a matching runner.
-
-### Run the runner as a launchd service (recommended)
-
-So it auto-starts after reboots:
+Replace `<TOKEN>` with the registration token from 3a, and `<owner>/<repo>` with the exact repo URL.
 
 ```bash
-cd ~/actions-runner
+./config.sh \
+  --url https://github.com/<owner>/<repo> \
+  --token <TOKEN> \
+  --name "mac-mini-<repo-shortname>" \
+  --labels "self-hosted,macOS,ARM64" \
+  --work "_work" \
+  --unattended
+```
+
+**Common 404 errors here** mean the URL doesn't match the repo the token was generated for. Both must be the same repo. Double-check with `git remote -v` on a local checkout if unsure.
+
+### Step 3d. Install as a launchd service
+
+So the runner auto-starts after Mac mini reboots:
+
+```bash
 ./svc.sh install
 ./svc.sh start
+./svc.sh status
 ```
 
-Verify it's online: GitHub → Settings → Actions → Runners → status should be "Idle".
+`status` should show "started" and a process ID.
+
+### Step 3e. Verify it's online
+
+On the Mac mini:
+```bash
+tail -n 10 /Users/ava/actions-runners/<repo-shortname>/_diag/Runner_*.log
+```
+Should end with "Listening for Jobs".
+
+On GitHub: the runner page should show the runner with a green dot, status "Idle".
 
 ## 4. Caller repo changes
 
-For each Capacitor project repo that wants to use the self-hosted runner:
-
 ### 4a. Switch the workflow `uses:` line
 
-In the caller repo's `.github/workflows/build.yml` (or whatever it's named), change:
+In the caller repo's `.github/workflows/build.yml`, change:
 
 ```yaml
 uses: webavenue/build-agent/.github/workflows/capacitor.yml@main
@@ -143,13 +187,11 @@ The Xcode project's `CODE_SIGN_STYLE` should stay `Automatic` (its default after
 
 ## 5. First-build smoke test
 
-Before relying on the self-hosted runner for shipping builds, do one test run:
-
-1. Trigger the caller repo's workflow as usual.
+1. Trigger the caller repo's workflow as usual (Actions tab → Build Agent → Run workflow).
 2. Watch the run page on GitHub. The Android and iOS jobs should pick up the `[self-hosted, macOS, ARM64]` label and run on the Mac mini.
-3. Tail the runner log on the Mac mini if something gets stuck:
+3. If something gets stuck, tail the runner log on the Mac mini:
    ```bash
-   tail -f ~/actions-runner/_diag/Runner_*.log
+   tail -f /Users/ava/actions-runners/<repo-shortname>/_diag/Runner_*.log
    ```
 
 ## 6. Switching back to cloud builds
@@ -163,13 +205,16 @@ Switch the caller repo's `uses:` line back to `capacitor.yml@main`. No other cha
 ### "No runner matching all labels: self-hosted, macOS, ARM64"
 The runner is offline or configured with different labels. On the Mac mini:
 ```bash
-cd ~/actions-runner && ./svc.sh status
+cd /Users/ava/actions-runners/<repo-shortname> && ./svc.sh status
 ```
+
+### `config.sh` returns 404 Not Found
+The URL and the registration token don't match the same repo. Verify the URL with `git remote -v` on a local checkout, regenerate the token from that exact repo's runner-new page, and re-run.
 
 ### Stale workspace
 Self-hosted runners preserve build artifacts between runs (a feature — warm caches). If something gets into a bad state:
 ```bash
-cd ~/actions-runner/_work && rm -rf *
+cd /Users/ava/actions-runners/<repo-shortname>/_work && rm -rf *
 ```
 Next build will be a clean checkout from scratch.
 
@@ -178,13 +223,22 @@ The dist cert isn't in the login keychain, or the keychain is locked. Re-verify:
 ```bash
 security find-identity -v -p codesigning
 ```
-If the keychain is locked after a reboot, unlock it manually once — or use `security unlock-keychain` with a stored password.
+If the keychain is locked after a reboot, unlock it manually once.
 
 ### iOS signing fails with "Failed to update profile"
 The App Store Connect API key doesn't have the right permissions. In App Store Connect → Users and Access → Keys, the key must have **App Manager** or **Admin** role.
 
-### Build runs but never completes
-The Mac mini may be running out of memory if some other process is competing (Xcode UI open, Chrome eating RAM, etc.). Close GUI apps before triggering builds, or upgrade RAM.
+### Two builds run at the same time and OOM
+With multiple repo-scoped runners on one Mac mini, simultaneous builds across repos run in parallel. With 16GB RAM, Xcode + Gradle in parallel can swap or OOM. Options:
+- Stagger build triggers manually
+- Set `concurrency` in the caller workflow to a shared group across repos (advanced)
+- Add RAM
 
-### Need to run two builds at once
-Out of scope for this setup. The workflow assumes sequential execution. If volume grows, add a second Mac mini with the same labels — GitHub will queue jobs across both runners.
+### Need to update the runner version
+GitHub auto-updates self-hosted runners by default. If auto-update is disabled or fails, manually:
+```bash
+cd /Users/ava/actions-runners/<repo-shortname>
+sudo ./svc.sh stop
+# Download new version, extract over existing files
+sudo ./svc.sh start
+```
