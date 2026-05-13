@@ -665,10 +665,10 @@ jobs:
 
           if [ "$ALL_SUCCESS" = "true" ]; then
             if [ "$ACTION" = "build only" ]; then
-              MESSAGE="Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n• ${RELEASE_NOTES}"
+              MESSAGE="Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}"
               MESSAGE="${MESSAGE}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_"
             else
-              MESSAGE="Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n• ${RELEASE_NOTES}"
+              MESSAGE="Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}"
 
               if [ "$ANDROID_RESULT" = "success" ]; then
                 ANDROID_LINE="\n\n:robot_face: Android → Play Store internal track"
