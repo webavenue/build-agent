@@ -186,6 +186,52 @@ jobs:
             exit 0
           fi
 
+          # ─── Enforce Play Store's 500-char limit ───
+          # Prompt aims for under 400; retry shortens overruns; hard truncate
+          # at 480 (snapped to the last newline) is the absolute safety net.
+          if [ ${#NOTES} -gt 500 ]; then
+            echo "⚠ Initial output was ${#NOTES} chars (Play limit: 500). Asking Claude to shorten."
+
+            RETRY_PAYLOAD=$(jq -n \
+              --arg model "claude-haiku-4-5" \
+              --arg notes "$NOTES" \
+              '{
+                model: $model,
+                max_tokens: 300,
+                messages: [{
+                  role: "user",
+                  content: ("Shorten these release notes to UNDER 450 characters total. Keep the same \"- \" bullet format. Drop the least-important items if needed. Output only the bullets — no preamble, no headers.\n\nCurrent notes:\n" + $notes)
+                }]
+              }')
+
+            RETRY_RESPONSE=$(curl -sS --max-time 30 -X POST https://api.anthropic.com/v1/messages \
+              -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "$RETRY_PAYLOAD" || echo "")
+
+            SHORTENED=$(echo "$RETRY_RESPONSE" | jq -r '.content[0].text // empty' 2>/dev/null || echo "")
+
+            if [ -n "$SHORTENED" ] && [ ${#SHORTENED} -lt ${#NOTES} ]; then
+              echo "✓ Shortened to ${#SHORTENED} chars"
+              NOTES="$SHORTENED"
+            else
+              echo "⚠ Retry didn't produce shorter notes — relying on hard truncate"
+            fi
+          fi
+
+          # Hard safety net: truncate to 480 chars, then snap back to the
+          # last newline so we never cut mid-bullet. Play hard-rejects > 500.
+          if [ ${#NOTES} -gt 500 ]; then
+            ORIGINAL_LEN=${#NOTES}
+            TRUNCATED=$(printf '%s' "$NOTES" | head -c 480)
+            # Drop the trailing partial line (everything after last newline).
+            # If there's no newline, this is a no-op and we keep the 480-char cut.
+            TRUNCATED="${TRUNCATED%$'\n'*}"
+            NOTES="$TRUNCATED"
+            echo "⚠ Hard-truncated from ${ORIGINAL_LEN} → ${#NOTES} chars"
+          fi
+
           emit "llm-generated" "$NOTES"
 
   # ───────────────────────────────────────────────────────────
