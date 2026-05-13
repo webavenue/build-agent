@@ -462,6 +462,31 @@ jobs:
         working-directory: ios/App
         run: pod install
 
+      # Workaround for `errSecInternalComponent` on the first 1-2 codesign
+      # calls under launchd. Even with `set-key-partition-list` granting
+      # codesign access, the Security framework sometimes fails the first
+      # few keychain queries until the session is fully warm. An explicit
+      # `security unlock-keychain` here primes the keychain for xcodebuild.
+      #
+      # Caller repo must set `MAC_LOGIN_PASSWORD` secret to the runner
+      # user's macOS login password. If unset, this step is a no-op —
+      # builds may still succeed if partition-list alone is enough.
+      - name: Unlock login keychain (codesign warm-up)
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.MAC_LOGIN_PASSWORD }}
+        run: |
+          if [ -z "$KEYCHAIN_PASSWORD" ]; then
+            echo "⚠ MAC_LOGIN_PASSWORD secret not set — skipping keychain unlock."
+            echo "  If codesign fails with errSecInternalComponent on the first frameworks,"
+            echo "  set this secret to the runner user's macOS login password."
+            exit 0
+          fi
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" ~/Library/Keychains/login.keychain-db
+          # Disable inactivity-based locking for the rest of this session.
+          security set-keychain-settings ~/Library/Keychains/login.keychain-db
+          echo "✓ Login keychain unlocked"
+
       # Calls `ship_auto` — a new lane caller repos must add. It uses
       # automatic signing via -allowProvisioningUpdates + the App Store
       # Connect API key (no manual signing patch, no profile install).
