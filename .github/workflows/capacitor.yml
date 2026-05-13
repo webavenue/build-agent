@@ -366,6 +366,7 @@ jobs:
           echo "✓ Release notes written (source: ${{ needs.changelog.outputs.source }})"
 
       - name: Run fastlane
+        timeout-minutes: 30
         env:
           APP_NAME: ${{ vars.APP_NAME }}
           ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
@@ -500,6 +501,7 @@ jobs:
         run: pod install
 
       - name: Run fastlane ios ship
+        timeout-minutes: 45
         env:
           APP_NAME: ${{ vars.APP_NAME }}
           IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
