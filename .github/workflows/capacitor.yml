@@ -647,6 +647,7 @@ jobs:
           (needs.android.result == 'success' || needs.ios.result == 'success')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
@@ -656,6 +657,8 @@ jobs:
           TAG="build-${VERSION_CODE}"
           TITLE="Build ${VERSION_CODE} — v${VERSION_NAME}"
 
+          # GH_REPO env var tells gh which repo to operate on without needing
+          # a local git checkout (this job never checks out the source).
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists — skipping."
             exit 0
