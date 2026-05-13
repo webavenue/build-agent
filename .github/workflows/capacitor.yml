@@ -302,8 +302,10 @@ jobs:
   notify:
     name: Notify
     needs: [android, ios]
+    # !cancelled() runs in every case except a manual workflow cancellation —
+    # so cancelled runs stay quiet, but failures and successes still notify.
     if: >
-      always() &&
+      !cancelled() &&
       (needs.android.result != 'skipped' || needs.ios.result != 'skipped') &&
       (inputs.do_slack || (inputs.do_asana && inputs.action == 'build + upload'))
     runs-on: ubuntu-latest
