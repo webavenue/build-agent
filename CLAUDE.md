@@ -5,12 +5,14 @@ Reusable GitHub Actions workflow repo for building and releasing **Capacitor** (
 ## Repo structure
 
 ```
-.github/workflows/capacitor.yml      # Reusable workflow for Capacitor apps
-scripts/push-secrets.sh              # Pushes secrets/variables to target GitHub repos via gh CLI
-.secrets.env.example                 # Combined template for shared + project-specific values
-.secrets.env                         # Shared secrets (Slack, Asana) — gitignored, never commit
+.github/workflows/capacitor.yml             # Reusable workflow for Capacitor apps (GitHub-hosted runners)
+.github/workflows/capacitor-selfhosted.yml  # Same workflow but for self-hosted Mac mini (Android + iOS sequential, automatic iOS signing)
+docs/self-hosted-setup.md                   # Runbook for installing the Mac mini runner + Fastfile changes
+scripts/push-secrets.sh                     # Pushes secrets/variables to target GitHub repos via gh CLI
+.secrets.env.example                        # Combined template for shared + project-specific values
+.secrets.env                                # Shared secrets (Slack, Asana) — gitignored, never commit
 <project_name>/
-  .secrets.env                       # Project-specific secrets (keystore, certs, app IDs) — gitignored
+  .secrets.env                              # Project-specific secrets (keystore, certs, app IDs) — gitignored
 ```
 
 **Secret layering:** root `.secrets.env` is loaded first, then `<project_name>/.secrets.env` on top. Project values override root values for the same key.
@@ -21,6 +23,13 @@ Caller repos reference it like:
 ```yaml
 uses: webavenue/build-agent/.github/workflows/capacitor.yml@main
 ```
+
+Or, for the self-hosted variant (one Mac mini, runs Android → iOS sequentially, automatic iOS signing):
+```yaml
+uses: webavenue/build-agent/.github/workflows/capacitor-selfhosted.yml@main
+```
+
+The self-hosted variant takes the same inputs and uses the same caller-repo secrets/vars — see [docs/self-hosted-setup.md](docs/self-hosted-setup.md) for runner install + the required `ship_auto` Fastlane lane.
 
 ### Workflow inputs
 | Input | Default | Description |
@@ -75,9 +84,10 @@ DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
 
 ## Workflow internals / gotchas
 
-- **Android:** ubuntu-latest, Java 21, Node 22, Ruby 3.1.6. Uses Fastlane.
-- **iOS:** macos-15, Xcode 26, Node 22, Ruby 3.1.6, CocoaPods 1.16.2. Uses Fastlane.
-- **Keystore conversion:** Android job converts PKCS12 keystore → JKS before signing. This is required because older BouncyCastle versions in the Android Gradle Plugin can't parse PKCS12 keystores created with JDK 9+.
+- **Android (cloud):** ubuntu-latest, Java 21, Node 22, Ruby 3.1.6. Uses Fastlane.
+- **iOS (cloud):** macos-15, Xcode 26, Node 22, Ruby 3.1.6, CocoaPods 1.16.2. Uses Fastlane.
+- **Self-hosted variant:** both Android + iOS on `[self-hosted, macOS, ARM64]` (one Mac mini), sequential — Android then iOS — because 16GB RAM can't reliably run Gradle + Xcode in parallel. iOS uses automatic signing via `xcodebuild -allowProvisioningUpdates` + App Store Connect API key, so no cert/profile decode is needed (host login keychain provides the dist cert). Caller repos must add a `lane :ship_auto` to their Fastfile — see docs/self-hosted-setup.md.
+- **Keystore conversion:** Android job converts PKCS12 keystore → JKS before signing. This is required because older BouncyCastle versions in the Android Gradle Plugin can't parse PKCS12 keystores created with JDK 9+. Applies to both cloud and self-hosted variants.
 - **Version code formula:** `version_code_offset + github.run_number`. Set different offsets per project to prevent collisions when multiple projects share the same workflow.
-- **Notifications:** After both Android and iOS jobs finish, a notify job creates Asana QA tasks and posts a Slack message with build status, download links, and release notes.
+- **Notifications:** After both Android and iOS jobs finish, a notify job creates Asana QA tasks and posts a Slack message with build status, download links, and release notes. Notify always runs on ubuntu-latest (both variants).
 - **Failure diagnosis:** On Android or iOS failure, the notify job pulls the failed-step logs via `gh run view --log-failed`, asks Claude Haiku 4.5 for a 2–4 sentence plain-English diagnosis, and posts it as a threaded reply to the Slack failure message. Requires `ANTHROPIC_API_KEY` on the caller repo; silently skipped if absent. Needs `actions: read` permission on the notify job (already declared).

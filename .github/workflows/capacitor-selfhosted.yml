@@ -1,0 +1,841 @@
+name: Capacitor Build (Self-Hosted, Reusable)
+
+# ─────────────────────────────────────────────────────────────
+# REUSABLE WORKFLOW — self-hosted Mac mini variant.
+#
+# Differences from capacitor.yml:
+#   • Both Android and iOS run on the same Mac mini, sequentially
+#     (Android → iOS) to avoid OOM contention on 16GB RAM.
+#   • Tool setup actions (setup-java/node/ruby/xcode) are dropped —
+#     host tools are used directly. See docs/self-hosted-setup.md
+#     for required versions.
+#   • iOS uses automatic signing via App Store Connect API key
+#     (xcodebuild -allowProvisioningUpdates). The dist cert lives
+#     in the host login keychain. No cert decode, no temp keychain,
+#     no provisioning profile install step.
+#   • iOS calls fastlane lane `ship_auto` (not `ship`). Caller repos
+#     must add this lane — see docs/self-hosted-setup.md.
+#
+# changelog + notify jobs still run on ubuntu-latest (no benefit
+# to self-hosting them, and it frees the Mac mini for build jobs).
+# ─────────────────────────────────────────────────────────────
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: '"build + upload" or "build only"'
+        type: string
+        required: true
+        default: 'build + upload'
+      build_android:
+        type: boolean
+        required: false
+        default: true
+      build_ios:
+        type: boolean
+        required: false
+        default: true
+      do_asana:
+        type: boolean
+        required: false
+        default: true
+      do_slack:
+        type: boolean
+        required: false
+        default: true
+      version_name:
+        type: string
+        required: true
+        default: '1.0.0'
+      release_notes:
+        description: 'Fallback notes used when auto_changelog is false, or when auto-generation has nothing to say (first build, no new commits, API unreachable).'
+        type: string
+        required: false
+        default: 'Bug fixes and performance improvements.'
+      auto_changelog:
+        description: 'When true, auto-generate release notes from commits since the last build tag using Claude. Falls back to release_notes on any failure.'
+        type: boolean
+        required: false
+        default: true
+      version_code_offset:
+        description: 'Added to github.run_number to produce the build/version code. Set per-project so codes never collide with previously uploaded builds.'
+        type: number
+        required: false
+        default: 100
+
+# ─────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────
+jobs:
+
+  # ───────────────────────────────────────────────────────────
+  # CHANGELOG — identical to capacitor.yml. Stays on ubuntu-latest
+  # since it's just curl/jq/gh/git and frees the Mac mini for builds.
+  # ───────────────────────────────────────────────────────────
+  changelog:
+    name: Generate changelog
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      notes: ${{ steps.generate.outputs.notes }}
+      qa_notes: ${{ steps.generate.outputs.qa_notes }}
+      source: ${{ steps.generate.outputs.source }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate
+        id: generate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          FALLBACK_NOTES: ${{ inputs.release_notes }}
+          AUTO_CHANGELOG: ${{ inputs.auto_changelog }}
+        run: |
+          set -uo pipefail
+
+          emit() {
+            echo "source=$1" >> "$GITHUB_OUTPUT"
+            {
+              echo "notes<<__NOTES_EOF__"
+              printf '%s\n' "$2"
+              echo "__NOTES_EOF__"
+              echo "qa_notes<<__QA_EOF__"
+              printf '%s\n' "$3"
+              echo "__QA_EOF__"
+            } >> "$GITHUB_OUTPUT"
+            echo "─── Changelog source: $1 ───"
+            echo "── User-facing notes (Play / TestFlight) ──"
+            printf '%s\n' "$2"
+            echo "── QA notes (Slack / Asana / GH Release) ──"
+            printf '%s\n' "$3"
+          }
+
+          call_claude() {
+            local payload response text
+            payload=$(jq -n \
+              --arg model "claude-haiku-4-5" \
+              --arg system "$1" \
+              --arg content "$2" \
+              --argjson max_tokens "$3" \
+              '{
+                model: $model,
+                max_tokens: $max_tokens,
+                system: $system,
+                messages: [{ role: "user", content: $content }]
+              }')
+            response=$(curl -sS --max-time 30 -X POST https://api.anthropic.com/v1/messages \
+              -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "$payload" || echo "")
+            text=$(echo "$response" | jq -r '.content[0].text // empty' 2>/dev/null || echo "")
+            if [ -z "$text" ]; then
+              echo "⚠ Claude call returned empty. First 500 chars of response:" >&2
+              echo "$response" | head -c 500 >&2
+              echo >&2
+            fi
+            printf '%s' "$text"
+          }
+
+          if [ "$AUTO_CHANGELOG" != "true" ]; then
+            emit "fallback:auto_changelog=false" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          PREV_TAG=$(gh release list --limit 100 \
+            --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.tagName | startswith("build-"))]
+                  | sort_by(.createdAt) | reverse
+                  | .[0].tagName // empty')
+
+          if [ -z "$PREV_TAG" ]; then
+            emit "fallback:no-previous-tag" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          PREV_SHA=$(gh release view "$PREV_TAG" \
+            --json targetCommitish --jq .targetCommitish 2>/dev/null || echo "")
+
+          if [ -z "$PREV_SHA" ] || ! git cat-file -e "$PREV_SHA" 2>/dev/null; then
+            emit "fallback:prev-sha-unreachable" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          COMMITS=$(git log "${PREV_SHA}..HEAD" --no-merges --pretty=format:"- %s")
+
+          if [ -z "$COMMITS" ]; then
+            emit "fallback:no-new-commits" "$FALLBACK_NOTES" "$FALLBACK_NOTES"
+            exit 0
+          fi
+
+          echo "Commits since $PREV_TAG ($PREV_SHA):"
+          printf '%s\n' "$COMMITS"
+          echo "──────"
+
+          COMMITS=$(printf '%s' "$COMMITS" | head -c 8000)
+
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            emit "raw-commits:no-api-key" "$COMMITS" "$COMMITS"
+            exit 0
+          fi
+
+          APP="${APP_NAME:-the app}"
+          USER_MSG=$(printf '%s\n\n%s' "Commits since the last build:" "$COMMITS")
+
+          USER_SYS=$(printf '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
+            "You write user-facing release notes for ${APP}. Input: git commit subjects. Output: 2-5 short bullets (under 400 chars total) summarising what end users will notice. Group related commits." \
+            "ORDER the bullets by user impact, most exciting first:" \
+            "  1. New features and content additions (e.g. \"Added daily reward chest\")" \
+            "  2. Improvements and changes to existing features (e.g. \"Faster loading on the home screen\")" \
+            "  3. Bug fixes and crash fixes (e.g. \"Fixed crash when opening settings\")" \
+            "Drop chore/refactor/test/build/ci/wip commits entirely — they are not user-facing. If commits are too vague or unparseable (e.g. all \"wip\" / \"fix\"), reply with exactly: Bug fixes and performance improvements. No headers, no preamble, no markdown other than \"- \" bullets, no trailing commentary.")
+
+          NOTES=$(call_claude "$USER_SYS" "$USER_MSG" 400)
+
+          if [ -n "$NOTES" ] && [ ${#NOTES} -gt 500 ]; then
+            echo "⚠ User-facing output was ${#NOTES} chars (Play limit: 500). Asking Claude to shorten."
+            SHORTEN_MSG=$(printf '%s\n\n%s\n%s' \
+              "Shorten these release notes to UNDER 450 characters total. Keep the same \"- \" bullet format. Drop the least-important items if needed. Output only the bullets — no preamble, no headers." \
+              "Current notes:" \
+              "$NOTES")
+            SHORTENED=$(call_claude "" "$SHORTEN_MSG" 300)
+            if [ -n "$SHORTENED" ] && [ ${#SHORTENED} -lt ${#NOTES} ]; then
+              echo "✓ Shortened to ${#SHORTENED} chars"
+              NOTES="$SHORTENED"
+            else
+              echo "⚠ Retry didn't produce shorter notes — relying on hard truncate"
+            fi
+          fi
+
+          if [ -n "$NOTES" ] && [ ${#NOTES} -gt 500 ]; then
+            ORIGINAL_LEN=${#NOTES}
+            TRUNCATED=$(printf '%s' "$NOTES" | head -c 480)
+            TRUNCATED="${TRUNCATED%$'\n'*}"
+            NOTES="$TRUNCATED"
+            echo "⚠ Hard-truncated from ${ORIGINAL_LEN} → ${#NOTES} chars"
+          fi
+
+          QA_SYS=$(printf '%s\n\n%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n%s\n\n%s' \
+            "You write internal release notes for a QA team that will test a mobile app build for ${APP}. Input: git commit subjects." \
+            "Output: a categorized list grouped by section. Use these section headers EXACTLY (emoji + uppercase), in this order, omitting any section that has no entries:" \
+            "🎯 NEW FEATURES" \
+            "- Each new feature on its own bullet, with a short hint about what to verify" \
+            "✨ IMPROVEMENTS" \
+            "- Each change to existing features — what surfaces are affected" \
+            "🐛 BUG FIXES" \
+            "- Each fix — scenario QA should reproduce or verify" \
+            "🔧 TECHNICAL" \
+            "- Refactors, dependency bumps, or infrastructure changes that COULD affect runtime behaviour (touch UI, change SDKs, etc.). Skip if none apply." \
+            "Drop purely internal commits (CI config edits, doc-only, formatting, comments). Each bullet should briefly say what changed PLUS a short testing hint. Aim for under 1500 characters total. Plain text — no markdown bold/italic, just \"- \" bullets and the section headers exactly as shown.")
+
+          QA_NOTES=$(call_claude "$QA_SYS" "$USER_MSG" 800)
+
+          if [ -z "$NOTES" ] && [ -z "$QA_NOTES" ]; then
+            emit "raw-commits:llm-failed" "$COMMITS" "$COMMITS"
+          elif [ -z "$NOTES" ]; then
+            emit "partial:user-llm-failed" "$COMMITS" "$QA_NOTES"
+          elif [ -z "$QA_NOTES" ]; then
+            emit "partial:qa-llm-failed" "$NOTES" "$COMMITS"
+          else
+            emit "llm-generated" "$NOTES" "$QA_NOTES"
+          fi
+
+  # ───────────────────────────────────────────────────────────
+  # ANDROID — self-hosted Mac mini
+  #
+  # Sequential w/ iOS: this job runs first, iOS waits on it. The
+  # Mac mini doesn't have enough RAM to run both in parallel.
+  # ───────────────────────────────────────────────────────────
+  android:
+    name: Build & Upload Android
+    needs: changelog
+    if: ${{ inputs.build_android }}
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Fail fast with a clear message if host tools are missing.
+      # See docs/self-hosted-setup.md for install steps.
+      - name: Verify host tools
+        run: |
+          set -e
+          MISSING=""
+          command -v java >/dev/null 2>&1 || MISSING="${MISSING} java"
+          command -v node >/dev/null 2>&1 || MISSING="${MISSING} node"
+          command -v npm  >/dev/null 2>&1 || MISSING="${MISSING} npm"
+          command -v ruby >/dev/null 2>&1 || MISSING="${MISSING} ruby"
+          command -v bundle >/dev/null 2>&1 || MISSING="${MISSING} bundle"
+          command -v keytool >/dev/null 2>&1 || MISSING="${MISSING} keytool"
+          if [ -n "$MISSING" ]; then
+            echo "✗ Missing required tools on host:$MISSING"
+            echo "  See docs/self-hosted-setup.md for installation steps."
+            exit 1
+          fi
+          echo "── Host tool versions ──"
+          java -version 2>&1 | head -1
+          node --version
+          npm --version
+          ruby --version
+          bundle --version
+
+      - name: Compute version code
+        id: version
+        run: |
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Version code will be: $CODE"
+
+      - name: Decode keystore
+        run: |
+          mkdir -p ci-certs
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ci-certs/release.keystore
+
+      # AGP uses BouncyCastle to read keystores. Newer PKCS12 keystores (created
+      # with JDK 9+) use AES-256 which older BouncyCastle can't parse ("Tag number
+      # over 30"). The JDK's own keytool CAN read any PKCS12, so we convert to JKS
+      # which BouncyCastle has always supported.
+      - name: Convert keystore to JKS
+        env:
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          keytool -importkeystore \
+            -srckeystore ci-certs/release.keystore \
+            -destkeystore ci-certs/release.jks \
+            -deststoretype JKS \
+            -srcstorepass "${STORE_PASS}" \
+            -deststorepass "${STORE_PASS}" \
+            -noprompt 2>&1 | grep -v "Warning" || true
+          echo "✓ Keystore converted to JKS"
+
+      - name: Decode Google Play key
+        run: |
+          echo "${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}" | base64 -d > ci-certs/google-play-key.json
+
+      - name: Decode google-services.json
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+            echo "$GOOGLE_SERVICES_JSON_BASE64" | base64 -d > android/app/google-services.json
+            echo "✓ google-services.json decoded"
+          else
+            echo "⚠ GOOGLE_SERVICES_JSON_BASE64 not set, skipping Firebase setup"
+          fi
+
+      - name: Install gems
+        run: bundle install --jobs 3
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build React app
+        run: npm run build
+
+      - name: Capacitor sync
+        run: npx cap sync android
+
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.changelog.outputs.notes }}
+        run: |
+          mkdir -p fastlane/metadata/android/en-US/changelogs
+          if [ -z "$NOTES" ]; then
+            NOTES="Bug fixes and performance improvements."
+          fi
+          printf '%s\n' "$NOTES" > fastlane/metadata/android/en-US/changelogs/${{ steps.version.outputs.code }}.txt
+          echo "✓ Release notes written (source: ${{ needs.changelog.outputs.source }})"
+
+      - name: Run fastlane
+        timeout-minutes: 30
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/ci-certs/release.jks
+          ANDROID_KEYSTORE_ALIAS: ${{ vars.ANDROID_KEYSTORE_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          GOOGLE_PLAY_JSON_KEY_PATH: ${{ github.workspace }}/ci-certs/google-play-key.json
+          GOOGLE_PLAY_TRACK: ${{ vars.GOOGLE_PLAY_TRACK }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
+        run: |
+          if [ "${{ inputs.action }}" = "build + upload" ]; then
+            bundle exec fastlane android ship
+          else
+            bundle exec fastlane android build_apk
+          fi
+
+      - name: Upload APK artifact
+        if: inputs.action == 'build only'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.version_name }}-${{ steps.version.outputs.code }}.apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 7
+
+
+  # ───────────────────────────────────────────────────────────
+  # iOS — self-hosted Mac mini, automatic signing
+  #
+  # Runs AFTER android (sequential on the same Mac mini) so we
+  # don't OOM with Gradle + Xcode in parallel.
+  #
+  # Uses `if: always()` so iOS still runs if Android failed —
+  # we want them independently shippable. Skipped only when
+  # explicitly disabled, changelog failed, or we're in
+  # build-only mode (no iOS-only IPA artifact path is wired up).
+  # ───────────────────────────────────────────────────────────
+  ios:
+    name: Build & Upload iOS
+    needs: [changelog, android]
+    if: >
+      always() &&
+      needs.changelog.result == 'success' &&
+      inputs.build_ios &&
+      inputs.action == 'build + upload' &&
+      needs.android.result != 'cancelled'
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify host tools
+        run: |
+          set -e
+          MISSING=""
+          command -v xcodebuild >/dev/null 2>&1 || MISSING="${MISSING} xcodebuild"
+          command -v node >/dev/null 2>&1 || MISSING="${MISSING} node"
+          command -v npm  >/dev/null 2>&1 || MISSING="${MISSING} npm"
+          command -v ruby >/dev/null 2>&1 || MISSING="${MISSING} ruby"
+          command -v bundle >/dev/null 2>&1 || MISSING="${MISSING} bundle"
+          command -v pod  >/dev/null 2>&1 || MISSING="${MISSING} pod (cocoapods)"
+          if [ -n "$MISSING" ]; then
+            echo "✗ Missing required tools on host:$MISSING"
+            echo "  See docs/self-hosted-setup.md for installation steps."
+            exit 1
+          fi
+          echo "── Host tool versions ──"
+          xcodebuild -version
+          node --version
+          ruby --version
+          pod --version
+          echo "── Code-signing identities ──"
+          security find-identity -v -p codesigning || true
+
+      - name: Compute version code
+        id: version
+        run: |
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Version code will be: $CODE"
+
+      - name: Decode Apple API key
+        run: |
+          mkdir -p ci-certs
+          echo "${{ secrets.APPLE_API_KEY_BASE64 }}" | base64 -d > ci-certs/apple-api-key.p8
+
+      - name: Install gems
+        run: bundle install --jobs 3
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build React app
+        run: npm run build
+
+      - name: Capacitor sync
+        run: npx cap sync ios
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios/App
+        run: pod install
+
+      # Calls `ship_auto` — a new lane caller repos must add. It uses
+      # automatic signing via -allowProvisioningUpdates + the App Store
+      # Connect API key (no manual signing patch, no profile install).
+      # The host's login keychain provides the dist cert.
+      - name: Run fastlane ios ship_auto
+        timeout-minutes: 45
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          IOS_SCHEME: ${{ vars.IOS_SCHEME }}
+          TESTFLIGHT_GROUPS: ${{ vars.TESTFLIGHT_GROUPS }}
+          APPLE_API_KEY_PATH: ${{ github.workspace }}/ci-certs/apple-api-key.p8
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.notes }}
+          CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
+        run: bundle exec fastlane ios ship_auto
+
+
+  # ───────────────────────────────────────────────────────────
+  # NOTIFY — identical to capacitor.yml. Stays on ubuntu-latest.
+  # ───────────────────────────────────────────────────────────
+  notify:
+    name: Notify
+    needs: [changelog, android, ios]
+    if: >
+      !cancelled() &&
+      (needs.android.result != 'skipped' || needs.ios.result != 'skipped') &&
+      (inputs.do_slack || (inputs.do_asana && inputs.action == 'build + upload'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+
+      - name: Create Android Asana QA task
+        id: asana_android
+        if: needs.android.result == 'success' && inputs.do_asana && inputs.action == 'build + upload'
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [Android] ${VERSION_CODE}(${VERSION_NAME}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+
+          REQUEST=$(jq -n \
+            --arg name "$TASK_NAME" \
+            --arg notes "$NOTES_BODY" \
+            --arg qa_project "$ASANA_QA_PROJECT_ID" \
+            --arg extra_project "$ASANA_PROJECT_ID" \
+            --arg assignee "$ASANA_ASSIGNEE_ID" \
+            '{
+              data: {
+                name: $name,
+                notes: $notes,
+                projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
+                assignee: $assignee
+              }
+            }')
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST")
+
+          echo "Asana response: $TASK_RESPONSE"
+          TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
+
+          if [ -z "$TASK_GID" ]; then
+            echo "⚠ Failed to create Android Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> $GITHUB_OUTPUT
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ Android Asana task created: ${TASK_URL}"
+            echo "task_url=${TASK_URL}" >> $GITHUB_OUTPUT
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      - name: Create iOS Asana QA task
+        id: asana_ios
+        if: needs.ios.result == 'success' && inputs.do_asana && inputs.action == 'build + upload'
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [iOS] ${VERSION_CODE}(${VERSION_NAME}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+
+          REQUEST=$(jq -n \
+            --arg name "$TASK_NAME" \
+            --arg notes "$NOTES_BODY" \
+            --arg qa_project "$ASANA_QA_PROJECT_ID" \
+            --arg extra_project "$ASANA_PROJECT_ID" \
+            --arg assignee "$ASANA_ASSIGNEE_ID" \
+            '{
+              data: {
+                name: $name,
+                notes: $notes,
+                projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
+                assignee: $assignee
+              }
+            }')
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST")
+
+          echo "Asana response: $TASK_RESPONSE"
+          TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
+
+          if [ -z "$TASK_GID" ]; then
+            echo "⚠ Failed to create iOS Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> $GITHUB_OUTPUT
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ iOS Asana task created: ${TASK_URL}"
+            echo "task_url=${TASK_URL}" >> $GITHUB_OUTPUT
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      - name: Slack notification
+        id: slack
+        if: always() && inputs.do_slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          SLACK_ANDROID_DOWNLOAD_URL: ${{ vars.SLACK_ANDROID_DOWNLOAD_URL }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
+          BRANCH: ${{ github.ref_name }}
+          ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
+          IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          ANDROID_RESULT="${{ needs.android.result }}"
+          IOS_RESULT="${{ needs.ios.result }}"
+          ACTION="${{ inputs.action }}"
+
+          PLATFORMS=""
+          ALL_SUCCESS=true
+
+          if [ "$ANDROID_RESULT" != "skipped" ]; then
+            if [ "$ANDROID_RESULT" = "success" ]; then
+              PLATFORMS="Android"
+            else
+              PLATFORMS="Android :x:"
+              ALL_SUCCESS=false
+            fi
+          fi
+
+          if [ "$IOS_RESULT" != "skipped" ]; then
+            if [ "$IOS_RESULT" = "success" ]; then
+              IOS_LABEL="iOS"
+            else
+              IOS_LABEL="iOS :x:"
+              ALL_SUCCESS=false
+            fi
+            if [ -n "$PLATFORMS" ]; then
+              PLATFORMS="${PLATFORMS} + ${IOS_LABEL}"
+            else
+              PLATFORMS="${IOS_LABEL}"
+            fi
+          fi
+
+          if [ "$ALL_SUCCESS" = "true" ]; then
+            if [ "$ACTION" = "build only" ]; then
+              MESSAGE=$(printf '%b' "Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_")
+            else
+              MESSAGE=$(printf '%b' "Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}")
+
+              if [ "$ANDROID_RESULT" = "success" ]; then
+                if [ -n "$SLACK_ANDROID_DOWNLOAD_URL" ]; then
+                  MESSAGE=$(printf '%b' "${MESSAGE}\n\n:robot_face: Android → Play Store internal track | <${SLACK_ANDROID_DOWNLOAD_URL}|Download>")
+                else
+                  MESSAGE=$(printf '%b' "${MESSAGE}\n\n:robot_face: Android → Play Store internal track")
+                fi
+              fi
+
+              if [ "$IOS_RESULT" = "success" ]; then
+                MESSAGE=$(printf '%b' "${MESSAGE}\n:apple: iOS → TestFlight")
+              fi
+
+              if [ -n "$ANDROID_TASK_URL" ]; then
+                MESSAGE=$(printf '%b' "${MESSAGE}\n:pushpin: Android QA: <${ANDROID_TASK_URL}|View task>")
+              fi
+              if [ -n "$IOS_TASK_URL" ]; then
+                MESSAGE=$(printf '%b' "${MESSAGE}\n:pushpin: iOS QA: <${IOS_TASK_URL}|View task>")
+              fi
+            fi
+          else
+            MESSAGE=$(printf '%b' "Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>")
+          fi
+
+          REQUEST=$(jq -n \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg text "$MESSAGE" \
+            '{channel: $channel, text: $text}')
+
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST")
+          TS=$(echo "$RESPONSE" | jq -r '.ts // empty')
+          echo "ts=${TS}" >> $GITHUB_OUTPUT
+          echo "✓ Slack notification sent (ts=${TS})"
+
+      - name: AI failure analysis (threaded reply)
+        if: >
+          always() && inputs.do_slack &&
+          (needs.android.result == 'failure' || needs.ios.result == 'failure') &&
+          steps.slack.outputs.ts != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          SLACK_TS: ${{ steps.slack.outputs.ts }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANDROID_RESULT: ${{ needs.android.result }}
+          IOS_RESULT: ${{ needs.ios.result }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "ANTHROPIC_API_KEY not configured on this repo — skipping AI analysis."
+            exit 0
+          fi
+
+          FAILED=""
+          [ "$ANDROID_RESULT" = "failure" ] && FAILED="Android"
+          [ "$IOS_RESULT" = "failure" ] && FAILED="${FAILED:+$FAILED + }iOS"
+
+          FAILED_JOB_IDS=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+            --jq '.jobs[] | select(.conclusion=="failure") | .databaseId')
+
+          if [ -z "$FAILED_JOB_IDS" ]; then
+            echo "Could not identify failed job IDs — skipping AI analysis."
+            exit 0
+          fi
+
+          LOGS=""
+          for JOB_ID in $FAILED_JOB_IDS; do
+            JOB_LOG=$(curl -sL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${REPO}/actions/jobs/${JOB_ID}/logs" \
+              | tail -n 500 || true)
+            if [ -n "$JOB_LOG" ]; then
+              LOGS="${LOGS}"$'\n'"${JOB_LOG}"
+            fi
+          done
+
+          LOGS=$(echo "$LOGS" | tail -c 30000)
+
+          if [ -z "$LOGS" ]; then
+            echo "No failed-step logs retrieved — skipping AI analysis."
+            exit 0
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg model "claude-haiku-4-5" \
+            --arg failed "$FAILED" \
+            --arg logs "$LOGS" \
+            '{
+              model: $model,
+              max_tokens: 400,
+              system: "You analyze GitHub Actions build-failure logs for a React + Capacitor app (Android via Gradle/Fastlane, iOS via Xcode/Fastlane). Your audience is non-developers on the project team. Reply in 2-4 short sentences: what failed, the most likely root cause (quote the actual error if visible), and one concrete next step. No code blocks, no headers, no preamble. If the cause is genuinely unclear from the logs, say so plainly.",
+              messages: [{
+                role: "user",
+                content: ("Platform(s) that failed: " + $failed + "\n\nTail of failed-step logs:\n\n" + $logs)
+              }]
+            }')
+
+          RESPONSE=$(curl -sS -X POST https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$PAYLOAD")
+
+          DIAGNOSIS=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+
+          if [ -z "$DIAGNOSIS" ]; then
+            echo "Claude returned no diagnosis. Raw response:"
+            echo "$RESPONSE"
+            exit 0
+          fi
+
+          TEXT=$':robot_face: *Likely cause:*\n'"$DIAGNOSIS"
+
+          REPLY=$(jq -n \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg thread_ts "$SLACK_TS" \
+            --arg text "$TEXT" \
+            '{channel: $channel, thread_ts: $thread_ts, text: $text}')
+
+          curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$REPLY" > /dev/null
+          echo "✓ AI diagnosis posted as threaded reply"
+
+      - name: Tag successful build
+        if: >
+          inputs.action == 'build + upload' &&
+          (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+          (needs.ios.result == 'success' || needs.ios.result == 'skipped') &&
+          (needs.android.result == 'success' || needs.ios.result == 'success')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
+        run: |
+          set -euo pipefail
+
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          TAG="build-${VERSION_CODE}"
+          TITLE="Build ${VERSION_CODE} — v${VERSION_NAME}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping."
+            exit 0
+          fi
+
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "$TITLE" \
+            --notes "$RELEASE_NOTES" \
+            --prerelease
+
+          echo "✓ Tagged release: $TAG @ ${{ github.sha }}"
