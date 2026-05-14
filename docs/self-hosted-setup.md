@@ -63,18 +63,29 @@ sdkmanager --list_installed
 
 The `ANDROID_HOME` env var needs to be set inside the runner process, not just your shell. We'll do that in §6.
 
-## 3. Disable the Gradle daemon
+## 3. Gradle global config
 
-The Gradle daemon causes hangs on self-hosted macOS — symptoms are: build starts fine, then `mapReleaseSourceSetPaths` or similar early task gets "stuck" at 0% CPU forever. The daemon's IPC with the wrapper fails in the launchd-spawned context.
-
-Fix it globally on the Mac mini:
+A few one-time tweaks in `~/.gradle/gradle.properties` make self-hosted builds reliable:
 
 ```bash
 mkdir -p ~/.gradle
-echo "org.gradle.daemon=false" >> ~/.gradle/gradle.properties
+cat >> ~/.gradle/gradle.properties <<'EOF'
+# Disable the Gradle daemon — daemon IPC hangs under launchd on macOS, manifesting
+# as a "stuck" early task (mapReleaseSourceSetPaths etc.) with 0% CPU forever.
+# One-shot JVM mode adds ~5-10s per build but never hangs.
+org.gradle.daemon=false
+
+# Bump HTTP timeouts. Some maven mirrors used by mediation SDKs (most notoriously
+# https://artifactory.bidmachine.io) are slow from non-US locations — 15-60s per
+# HEAD/GET request, occasional total stalls. Default 10s connect / 30s read trips
+# Gradle into thinking the artifact is unreachable. 60s/180s gives slow-but-eventually-
+# successful requests room to land.
+systemProp.org.gradle.internal.http.connectionTimeout=60000
+systemProp.org.gradle.internal.http.socketTimeout=180000
+EOF
 ```
 
-Every Gradle invocation now uses a one-shot JVM. Builds are ~5–10 seconds slower per run (negligible), no more hangs.
+The HTTP timeout bump alone isn't enough if the caller project lists BidMachine BEFORE its vendor-specific repos — Gradle still queries the slow mirror first for every artifact. See §10 troubleshooting for the project-side `android/build.gradle` reorder.
 
 ## 4. iOS signing prerequisites
 
@@ -332,6 +343,49 @@ ps -ef | grep -i gradle | grep -v grep
 kill -9 <pids>
 ```
 Then re-trigger the workflow.
+
+### Gradle dependency resolution times out / fails on Pangle, Chartboost, etc.
+
+Symptom: `Could not resolve com.pangle.global:pag-sdk:7.9.1.3` (or chartboost-sdk, mintegral-sdk, smaato-sdk…) with `Read timed out` or `Could not GET 'https://artifactory.bidmachine.io/...'`.
+
+Capacitor projects with AppLovin/MAX mediation include BidMachine's artifactory in `android/build.gradle`:
+```gradle
+maven { url 'https://artifactory.bidmachine.io/bidmachine' }
+```
+BidMachine mirrors most mediation SDKs but is slow from non-US locations (15–60s per request). If it's listed BEFORE the vendor-specific repos (chartboost.jfrog.io, bytedance.com, mintegral.com, etc.), Gradle tries BidMachine first for every artifact and stalls.
+
+**Fix in the caller project's `android/build.gradle`** (one-time edit, commit to the project's repo):
+
+1. **Move BidMachine LAST** in the `allprojects.repositories` block, so vendor repos take precedence. BidMachine then only gets queried for things no vendor repo has.
+2. **Add Smaato's own S3 repo** — `com.smaato.*` lives at `https://s3.amazonaws.com/smaato-sdk-releases/`, not on Maven Central. Without it, Gradle falls through to AppLovin's repo and gets 403.
+3. **Scope AppLovin's repo** to its own group — `https://artifacts.applovin.com/android` returns 403 for non-AppLovin packages, halting resolution. Wrap with `content { includeGroupByRegex "com\\.applovin\\..*" }` so Gradle only consults it for `com.applovin.*`.
+
+Final `allprojects.repositories` block ordering looks like:
+```gradle
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://maven.ogury.co' }
+        maven { url 'https://repo.pubmatic.com/artifactory/public-repos' }
+        maven { url 'https://artifact.bytedance.com/repository/pangle' }
+        maven { url 'https://cboost.jfrog.io/artifactory/chartboost-ads/' }
+        maven { url 'https://dl-maven-android.mintegral.com/repository/mbridge_android_sdk_oversea' }
+        maven { url 'https://verve.jfrog.io/artifactory/verve-gradle-release' }
+        maven { url 'https://s3.amazonaws.com/smaato-sdk-releases/' }       // NEW
+        maven {
+            url 'https://artifacts.applovin.com/android'
+            content { includeGroupByRegex "com\\.applovin\\..*" }            // SCOPED
+        }
+        maven { url 'https://jitpack.io' }
+        maven { url 'https://artifactory.bidmachine.io/bidmachine' }         // MOVED LAST
+    }
+}
+```
+
+This fix shipped to `webavenue/flight-manager` on commit `4841c9c` — clone that as a reference. Combined with the HTTP timeout bump in §3, dependency resolution completes reliably on the Mac mini for projects with heavy mediation.
+
+The few packages that legitimately need BidMachine (e.g. `com.explorestack.*`, `io.bidmachine.*`) will still be slow on first download — but those resolve once, get cached in `~/.gradle/caches/`, and stay fast on subsequent builds.
 
 ### Android build fails with "SDK location not found" / "ANDROID_HOME"
 The runner doesn't have `ANDROID_HOME` in its environment. Check `/Users/ava/actions-runners/<repo>/.env` has the line, and restart the runner service:
