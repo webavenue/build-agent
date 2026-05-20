@@ -98,9 +98,11 @@ DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
 
 ## Automated PR review (claude-review.yml)
 
-Reusable workflow that runs `anthropics/claude-code-action@v1` on each PR with a checklist tuned to the project stack. Designed to be the first reviewer on AI-generated game code — it catches the failure modes humans skim past (invented APIs, stale-closure bugs, missing Capacitor permissions, Unity null-check traps).
+Reusable workflow that runs `anthropics/claude-code-action@v1` on a PR with a checklist tuned to the project stack. Designed to be the first reviewer on AI-generated game code — it catches the failure modes humans skim past (invented APIs, stale-closure bugs, missing Capacitor permissions, Unity null-check traps).
 
-### Caller usage
+Supports two trigger modes — caller picks one. The reusable workflow handles both `pull_request` and `issue_comment` events; the gate resolves PR context (head ref, draft state, file count) on either path.
+
+### Caller usage — automatic on every PR push
 
 ```yaml
 # In <game-repo>/.github/workflows/pr-review.yml
@@ -116,6 +118,28 @@ jobs:
       project_type: capacitor   # or "unity"
     secrets: inherit
 ```
+
+### Caller usage — manual via `/review` comment
+
+```yaml
+# In <game-repo>/.github/workflows/pr-review.yml
+name: PR Review
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    if: >
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/review')
+    uses: webavenue/build-agent/.github/workflows/claude-review.yml@main
+    with:
+      project_type: unity
+    secrets: inherit
+```
+
+The `if:` filters out comments on issues (vs PRs) and comments that don't start with `/review`. Trigger phrase is case-sensitive. The reviewer can append free-form text — `/review focus on the new spawner` works and Claude will see that hint in the PR context.
 
 ### Inputs
 | Input | Default | Description |

@@ -65,19 +65,30 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      issues: read
     outputs:
       should_review: ${{ steps.decide.outputs.should_review }}
       reason: ${{ steps.decide.outputs.reason }}
+      pr_number: ${{ steps.decide.outputs.pr_number }}
+      pr_head_ref: ${{ steps.decide.outputs.pr_head_ref }}
     steps:
       - name: Decide
         id: decide
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          # pull_request event fields
+          PR_NUM_FROM_PR: ${{ github.event.pull_request.number }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
-          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          # issue_comment event fields
+          PR_NUM_FROM_ISSUE: ${{ github.event.issue.number }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request != null }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_AUTHOR_TYPE: ${{ github.event.comment.user.type }}
+          # inputs
           SKIP_DRAFTS: ${{ inputs.skip_drafts }}
           MAX_FILES: ${{ inputs.max_changed_files }}
         run: |
@@ -89,12 +100,38 @@ jobs:
             echo "Decision: $1 ($2)"
           }
 
-          if [ "${SKIP_DRAFTS}" = "true" ] && [ "${IS_DRAFT}" = "true" ]; then
+          # ── Resolve PR context (both event types) ──────────────
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            PR_NUMBER="${PR_NUM_FROM_PR}"
+            AUTHOR="${PR_AUTHOR}"
+            AUTHOR_TYPE="${PR_AUTHOR_TYPE}"
+            DRAFT="${IS_DRAFT}"
+          elif [ "${EVENT_NAME}" = "issue_comment" ]; then
+            if [ "${IS_PR_COMMENT}" != "true" ]; then
+              emit "false" "Comment is on an issue, not a PR"; exit 0
+            fi
+            PR_NUMBER="${PR_NUM_FROM_ISSUE}"
+            AUTHOR="${COMMENT_AUTHOR}"
+            AUTHOR_TYPE="${COMMENT_AUTHOR_TYPE}"
+            # draft state isn't on the comment event — look it up
+            DRAFT=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json isDraft -q .isDraft)
+          else
+            emit "false" "Unsupported event: ${EVENT_NAME} (expected pull_request or issue_comment)"; exit 0
+          fi
+
+          # ── Always emit pr_number + head ref so the review job
+          #    can checkout the right code on either event type ──
+          HEAD_REF=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefName -q .headRefName)
+          echo "pr_number=${PR_NUMBER}"     >> "$GITHUB_OUTPUT"
+          echo "pr_head_ref=${HEAD_REF}"    >> "$GITHUB_OUTPUT"
+
+          # ── Cheap pre-checks ──────────────────────────────────
+          if [ "${SKIP_DRAFTS}" = "true" ] && [ "${DRAFT}" = "true" ]; then
             emit "false" "PR is a draft"; exit 0
           fi
 
           if [ "${AUTHOR_TYPE}" = "Bot" ]; then
-            emit "false" "Author ${AUTHOR} is a bot"; exit 0
+            emit "false" "Triggering user ${AUTHOR} is a bot"; exit 0
           fi
 
           if [ "${MAX_FILES}" != "0" ]; then
@@ -127,6 +164,10 @@ jobs:
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
+          # On issue_comment events the default ref is the base branch.
+          # The gate resolved the PR's head branch — check that out
+          # instead so Claude reviews the actual proposed code.
+          ref: ${{ needs.gate.outputs.pr_head_ref }}
           fetch-depth: 0
 
       - name: Validate project_type
@@ -143,8 +184,27 @@ jobs:
         env:
           PROJECT_TYPE: ${{ inputs.project_type }}
           EXTRA: ${{ inputs.extra_instructions }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
+
+          # If triggered by a /review comment with trailing text, treat
+          # the trailing text as additional reviewer focus and append it
+          # to EXTRA so Claude sees it. Example: "/review check the spawner"
+          # → EXTRA gains "check the spawner".
+          if [ "${EVENT_NAME}" = "issue_comment" ] && [ -n "${COMMENT_BODY:-}" ]; then
+            COMMENT_TAIL=$(printf '%s' "${COMMENT_BODY}" \
+              | sed -E 's/^[[:space:]]*\/review[[:space:]]*//' \
+              | sed -E 's/[[:space:]]+$//')
+            if [ -n "${COMMENT_TAIL}" ] && [ "${COMMENT_TAIL}" != "${COMMENT_BODY}" ]; then
+              if [ -n "${EXTRA}" ]; then
+                EXTRA="${EXTRA}"$'\n'"Reviewer asked: ${COMMENT_TAIL}"
+              else
+                EXTRA="Reviewer asked: ${COMMENT_TAIL}"
+              fi
+            fi
+          fi
 
           # Shared header — keeps reviews focused on real bugs, not style.
           COMMON='You are reviewing a pull request. Be a senior engineer doing a code review, not a linter.
