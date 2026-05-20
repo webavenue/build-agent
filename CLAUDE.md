@@ -102,6 +102,8 @@ Reusable workflow that runs `anthropics/claude-code-action@v1` on a PR with a ch
 
 Supports two trigger modes — caller picks one. The reusable workflow handles both `pull_request` and `issue_comment` events; the gate resolves PR context (head ref, draft state, file count) on either path.
 
+> **Required caller `permissions:` block.** Reusable-workflow calls cap permissions at what the caller grants — per-job permissions in the called workflow have no effect if the caller hasn't granted them. Repos with a restricted default `GITHUB_TOKEN` policy (which is most of ours) will see GHA cancel the run with `is only allowed 'issues: none, pull-requests: none'`. Always include the block shown below in the caller.
+
 ### Caller usage — automatic on every PR push
 
 ```yaml
@@ -110,6 +112,13 @@ name: PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
 
 jobs:
   review:
@@ -128,6 +137,13 @@ on:
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
 jobs:
   review:
     if: >
@@ -136,16 +152,38 @@ jobs:
     uses: webavenue/build-agent/.github/workflows/claude-review.yml@main
     with:
       project_type: unity
+      model: claude-haiku-4-5   # default; reviewer can override per-call
     secrets: inherit
 ```
 
-The `if:` filters out comments on issues (vs PRs) and comments that don't start with `/review`. Trigger phrase is case-sensitive. The reviewer can append free-form text — `/review focus on the new spawner` works and Claude will see that hint in the PR context.
+The `if:` filters out comments on issues (vs PRs) and comments that don't start with `/review` (case-sensitive prefix). Comment grammar — parsed by the reusable workflow:
+
+```
+/review                                  → use caller's default model
+/review opus                             → claude-opus-4-7    (deepest, ~25x haiku)
+/review sonnet                           → claude-sonnet-4-6  (balanced)
+/review haiku                            → claude-haiku-4-5   (cheapest)
+/review <model> focus on the spawner     → model override + focus hint
+/review focus on the spawner             → default model + focus hint
+```
+
+Model keyword must be the first token after `/review` (case-insensitive). Anything else after that becomes a "Reviewer asked: …" line appended to the prompt so Claude knows where to focus. A reviewer using the word "opusified" in their notes won't false-trigger the Opus model — matching is whole-token only.
+
+### Tool permissions inside Claude (not GHA permissions)
+
+The action's default permission mode prompts for each tool use — and since CI has no human to approve, every tool call is denied. The reusable workflow already passes the necessary allowlist via `--allowed-tools` in `claude_args`. If you're customizing the action elsewhere, the minimum set for PR reviews is:
+
+```
+Read,Glob,Grep,LS,Bash,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment
+```
+
+The two `mcp__github_*` tools are how the action surfaces comments to the PR — without them allowlisted, Claude can analyze the code but has no way to post findings.
 
 ### Inputs
 | Input | Default | Description |
 |---|---|---|
 | `project_type` | _required_ | `"capacitor"` or `"unity"` — selects the review checklist |
-| `model` | `claude-sonnet-4-6` | Anthropic model id. Use `claude-opus-4-7` for deeper review at ~5x the cost. |
+| `model` | `claude-haiku-4-5` | Default model. Reviewers can override per-comment with `/review opus\|sonnet\|haiku ...`. |
 | `max_changed_files` | `80` | Skip review when the PR touches more files than this (cost guard). `0` disables. |
 | `skip_drafts` | `true` | Don't review draft PRs. |
 | `extra_instructions` | `""` | Extra prompt text appended to the checklist (e.g. "Pay extra attention to the new payments flow."). |
@@ -164,7 +202,7 @@ Both checklists explicitly tell Claude **not** to comment on style, naming, or "
 
 ### Cost notes
 
-- Sonnet 4.6 on a typical 5–20 file PR runs ~$0.05–$0.30. Opus 4.7 is ~5x. The `max_changed_files` guard short-circuits unusually large PRs (vendored asset commits, generated code) before any tokens are spent.
+- Cost per typical 5–20 file PR — Haiku 4.5 ~$0.02–$0.10, Sonnet 4.6 ~$0.05–$0.30, Opus 4.7 ~$0.50–$1.50. Default is Haiku because it's good enough to catch the common AI-generated game-code mistakes; escalate to Opus per-PR with `/review opus` when the change is gnarly. The `max_changed_files` guard short-circuits unusually large PRs (vendored asset commits, generated code) before any tokens are spent.
 - Bot authors (dependabot, renovate) are skipped automatically.
 
 ## Self-hosted Mac mini — non-obvious gotchas
