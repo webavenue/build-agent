@@ -159,15 +159,22 @@ jobs:
 The `if:` filters out comments on issues (vs PRs) and comments that don't start with `/review` (case-sensitive prefix). Comment grammar — parsed by the reusable workflow:
 
 ```
-/review                                  → use caller's default model
-/review opus                             → claude-opus-4-7    (deepest, ~25x haiku)
-/review sonnet                           → claude-sonnet-4-6  (balanced)
-/review haiku                            → claude-haiku-4-5   (cheapest)
-/review <model> focus on the spawner     → model override + focus hint
-/review focus on the spawner             → default model + focus hint
+/review [opus|sonnet|haiku] [gdd:<url>] [free-form focus hint...]
 ```
 
-Model keyword must be the first token after `/review` (case-insensitive). Anything else after that becomes a "Reviewer asked: …" line appended to the prompt so Claude knows where to focus. A reviewer using the word "opusified" in their notes won't false-trigger the Opus model — matching is whole-token only.
+Examples:
+```
+/review                                      → caller's default model
+/review opus                                 → claude-opus-4-7  (deepest, ~25x haiku)
+/review sonnet                               → claude-sonnet-4-6
+/review haiku                                → claude-haiku-4-5
+/review focus on the spawner                 → default model + focus hint
+/review opus focus on the spawner            → model override + focus hint
+/review gdd:https://docs.google.com/document/d/<id>/edit
+/review opus gdd:https://docs.google.com/document/d/<id>/edit focus on combat
+```
+
+Tokens are positional and case-insensitive for the model keyword. `gdd:<url>` must be a single whitespace-bounded token; Google Docs URLs have no spaces so this works. URLs wrapped in `<>` by GitHub's autolinker are also accepted. Anything after the optional `gdd:` token becomes a "Reviewer asked: …" line appended to the prompt so Claude knows where to focus. A reviewer using the word "opusified" in their notes won't false-trigger the Opus model — matching is whole-token only.
 
 ### Tool permissions inside Claude (not GHA permissions)
 
@@ -194,6 +201,30 @@ The two `mcp__github_*` tools are how the action surfaces comments to the PR —
 - **Unity:** Unity `Object` null pitfalls (`?.` lies about destroyed objects), coroutine/lifecycle leaks, hot-path allocations (LINQ in Update, boxing, GetComponent), event subscription leaks, mobile input/perf settings, and AI hallucinations (deprecated/nonexistent APIs).
 
 Both checklists explicitly tell Claude **not** to comment on style, naming, or "nice to haves" — only `[BUG]`, `[SECURITY]`, `[PERF]`, `[CRASH-RISK]`, or `[LOGIC]` issues earn inline comments. Everything else goes into a single sticky summary comment.
+
+### GDD validation (optional, per-comment)
+
+Reviewers can attach a Game Design Document URL to a single review by adding `gdd:<url>` to the comment:
+
+```
+/review gdd:https://docs.google.com/document/d/<DOC-ID>/edit
+/review opus gdd:https://docs.google.com/document/d/<DOC-ID>/edit focus on the spawner
+```
+
+When present, the workflow:
+1. Extracts the doc ID (accepts standard share URLs, URLs wrapped in `<>` by GitHub's autolinker, and bare doc IDs).
+2. Fetches the GDD as markdown via `https://docs.google.com/document/d/<ID>/export?format=markdown` — no auth, relies on **"Anyone with the link can view"** sharing.
+3. Prepends the GDD to the review prompt under a clearly labeled section and adds a `[GDD-DRIFT]` severity tag to the inline-comment allowlist.
+4. Soft-fails on any fetch error (404, 403, malformed URL) — the review continues without GDD context and the failure reason is reported in the sticky summary.
+
+**`[GDD-DRIFT]` is advisory, not blocking.** The prompt explicitly tells Claude that GDDs often lag implementation: if a deviation is found, Claude asks whether the GDD or the code should change — it doesn't claim the PR is wrong.
+
+**Doc size.** GDDs are truncated at 200KB (≈50 pages, ≈25K tokens). For a giant master GDD, point at a feature-specific sub-doc instead — the per-PR URL design assumes the reviewer picks the relevant doc.
+
+**Cost added per review** (rough, for a 5-page feature GDD ≈ 2K tokens):
+- Haiku: +$0.002
+- Sonnet: +$0.006
+- Opus: +$0.03
 
 ### Requirements on the caller repo
 

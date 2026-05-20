@@ -192,20 +192,21 @@ jobs:
 
           # Start with the caller's default model; comment may override below.
           EFFECTIVE_MODEL="${DEFAULT_MODEL}"
+          GDD_URL=""
+          GDD_FETCH_ERROR=""
 
-          # Parse `/review [model] [extra notes...]` from comment events.
-          # First token after `/review` may be a model keyword:
-          #   opus   → claude-opus-4-7
-          #   sonnet → claude-sonnet-4-6
-          #   haiku  → claude-haiku-4-5
-          # Anything after (or all of TAIL if no keyword) becomes EXTRA so
-          # Claude sees the reviewer's focus hint.
+          # ────────────────────────────────────────────────────
+          # Parse the /review comment.
+          # Grammar (each token optional, in order):
+          #   /review [opus|sonnet|haiku] [gdd:<url>] [free-form focus hint...]
+          # ────────────────────────────────────────────────────
           if [ "${EVENT_NAME}" = "issue_comment" ] && [ -n "${COMMENT_BODY:-}" ]; then
             TAIL=$(printf '%s' "${COMMENT_BODY}" \
               | sed -E 's/^[[:space:]]*\/review[[:space:]]*//' \
               | sed -E 's/[[:space:]]+$//')
-            FIRST_TOKEN=$(printf '%s' "${TAIL}" | awk '{print tolower($1)}')
 
+            # Token 1: model keyword (optional)
+            FIRST_TOKEN=$(printf '%s' "${TAIL}" | awk '{print tolower($1)}')
             case "${FIRST_TOKEN}" in
               opus)
                 EFFECTIVE_MODEL="claude-opus-4-7"
@@ -221,7 +222,20 @@ jobs:
                 ;;
             esac
 
-            # Remaining TAIL (if any) → reviewer focus hint.
+            # Token 2: gdd:<url> (optional)
+            GDD_TOKEN=$(printf '%s' "${TAIL}" | awk '{print $1}')
+            case "${GDD_TOKEN}" in
+              gdd:*)
+                # Strip prefix, strip GitHub's autolinker <> wrapping, strip trailing punctuation
+                GDD_URL=$(printf '%s' "${GDD_TOKEN}" \
+                  | sed -E 's/^gdd://' \
+                  | sed -E 's/^[<(]//' \
+                  | sed -E 's/[>),.;]+$//')
+                TAIL=$(printf '%s' "${TAIL}" | sed -E 's/^[^[:space:]]+[[:space:]]*//')
+                ;;
+            esac
+
+            # Anything still in TAIL → reviewer focus hint
             if [ -n "${TAIL}" ] && [ "${TAIL}" != "${COMMENT_BODY}" ]; then
               if [ -n "${EXTRA}" ]; then
                 EXTRA="${EXTRA}"$'\n'"Reviewer asked: ${TAIL}"
@@ -232,7 +246,50 @@ jobs:
           fi
 
           echo "Effective model: ${EFFECTIVE_MODEL}"
+          echo "GDD URL: ${GDD_URL:-<none>}"
           echo "effective_model=${EFFECTIVE_MODEL}" >> "$GITHUB_OUTPUT"
+
+          # ────────────────────────────────────────────────────
+          # Fetch the GDD if one was specified. Soft-fail on any
+          # error so a broken Drive link doesn't block the review.
+          # ────────────────────────────────────────────────────
+          rm -f /tmp/gdd.md
+          if [ -n "${GDD_URL}" ]; then
+            # Extract Google Docs document ID. Accepts:
+            #   https://docs.google.com/document/d/<ID>/edit?usp=sharing
+            #   https://docs.google.com/document/d/<ID>
+            #   <ID>  (bare 25+ char id)
+            DOC_ID=$(printf '%s' "${GDD_URL}" \
+              | grep -oE '/d/[A-Za-z0-9_-]+' \
+              | sed -E 's|^/d/||' \
+              | head -n1 || true)
+            if [ -z "${DOC_ID}" ] && printf '%s' "${GDD_URL}" | grep -qE '^[A-Za-z0-9_-]{25,}$'; then
+              DOC_ID="${GDD_URL}"
+            fi
+
+            if [ -z "${DOC_ID}" ]; then
+              GDD_FETCH_ERROR="could not extract a Google Docs document ID from URL: ${GDD_URL}"
+              echo "::warning::${GDD_FETCH_ERROR}"
+            else
+              EXPORT_URL="https://docs.google.com/document/d/${DOC_ID}/export?format=markdown"
+              echo "Fetching GDD from: ${EXPORT_URL}"
+              if curl -sSfL --max-time 30 --max-filesize 10485760 \
+                   -o /tmp/gdd.md "${EXPORT_URL}" 2>/tmp/gdd_err.log; then
+                BYTES=$(wc -c </tmp/gdd.md)
+                echo "GDD fetched: ${BYTES} bytes"
+                # Cap at 200KB to bound token cost. Section-specific GDDs
+                # should fit comfortably; only the 219-pager would truncate.
+                if [ "${BYTES}" -gt 204800 ]; then
+                  head -c 204800 /tmp/gdd.md > /tmp/gdd.trunc && mv /tmp/gdd.trunc /tmp/gdd.md
+                  echo "::warning::GDD was ${BYTES} bytes — truncated to 200KB"
+                fi
+              else
+                GDD_FETCH_ERROR="curl failed for ${EXPORT_URL} — $(tr '\n' ' ' </tmp/gdd_err.log)"
+                echo "::warning::${GDD_FETCH_ERROR}"
+                rm -f /tmp/gdd.md
+              fi
+            fi
+          fi
 
           # Shared header — keeps reviews focused on real bugs, not style.
           COMMON='You are reviewing a pull request. Be a senior engineer doing a code review, not a linter.
@@ -317,13 +374,38 @@ jobs:
           {
             echo "${COMMON}"
             echo "${CHECKLIST}"
+
+            if [ -s /tmp/gdd.md ]; then
+              echo ""
+              echo "Game Design Document validation:"
+              echo "- A GDD describing intended behavior is attached below. Cross-reference the diff against it."
+              echo "- If the diff appears to deviate from the GDD specification, flag the deviation with [GDD-DRIFT]."
+              echo "- IMPORTANT: GDDs often lag implementation. Do NOT claim the PR is wrong. Instead, ASK in the inline comment whether the GDD should be updated to match the new design, OR whether the implementation should change to match the GDD. The reviewer will decide."
+              echo "- Only raise [GDD-DRIFT] for meaningful gameplay, balance, UI, or flow deviations — not for unrelated code paths the GDD doesn't cover."
+              echo ""
+              echo "=== BEGIN GAME DESIGN DOCUMENT ==="
+              cat /tmp/gdd.md
+              echo ""
+              echo "=== END GAME DESIGN DOCUMENT ==="
+            fi
+
             if [ -n "${EXTRA}" ]; then
               echo ""
               echo "Additional instructions for this repo:"
               echo "${EXTRA}"
             fi
+
+            if [ -n "${GDD_FETCH_ERROR}" ]; then
+              echo ""
+              echo "Note: The reviewer specified a GDD URL but the fetch failed — ${GDD_FETCH_ERROR}. Proceed with the code review and mention this fetch failure (with the reason) in your sticky summary so the reviewer knows."
+            fi
+
             echo ""
-            echo "When done, post exactly one sticky summary comment. Inline comments only for things tagged [BUG], [SECURITY], [PERF], [CRASH-RISK], or [LOGIC]."
+            if [ -s /tmp/gdd.md ]; then
+              echo "When done, post exactly one sticky summary comment. Inline comments only for things tagged [BUG], [SECURITY], [PERF], [CRASH-RISK], [LOGIC], or [GDD-DRIFT]."
+            else
+              echo "When done, post exactly one sticky summary comment. Inline comments only for things tagged [BUG], [SECURITY], [PERF], [CRASH-RISK], or [LOGIC]."
+            fi
           } > /tmp/review_prompt.txt
 
           echo "Prompt size: $(wc -c </tmp/review_prompt.txt) bytes"
