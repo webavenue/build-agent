@@ -1,0 +1,260 @@
+name: Claude PR Review (Reusable)
+
+# ─────────────────────────────────────────────────────────────
+# REUSABLE WORKFLOW — called by individual project repos to run
+# an automated Claude code review on every pull request.
+#
+# Caller usage:
+#
+#   # In <game-repo>/.github/workflows/pr-review.yml
+#   name: PR Review
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+#   jobs:
+#     review:
+#       uses: webavenue/build-agent/.github/workflows/claude-review.yml@main
+#       with:
+#         project_type: capacitor   # or "unity"
+#       secrets: inherit
+#
+# Requires ANTHROPIC_API_KEY on the caller repo. The action posts
+# inline comments and a sticky summary to the PR.
+# ─────────────────────────────────────────────────────────────
+on:
+  workflow_call:
+    inputs:
+      project_type:
+        description: '"capacitor" (React+Vite+Capacitor) or "unity"'
+        type: string
+        required: true
+      model:
+        description: 'Claude model id, e.g. claude-sonnet-4-6 (balanced) or claude-opus-4-7 (deeper review, ~5x cost)'
+        type: string
+        required: false
+        default: 'claude-sonnet-4-6'
+      max_changed_files:
+        description: 'Skip review if PR changes more than this many files (cost guard). Set 0 to disable.'
+        type: number
+        required: false
+        default: 80
+      skip_drafts:
+        description: 'Skip review when PR is in draft state.'
+        type: boolean
+        required: false
+        default: true
+      extra_instructions:
+        description: 'Optional extra prompt text appended to the checklist (e.g. "Pay extra attention to the new payments flow.")'
+        type: string
+        required: false
+        default: ''
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────
+  # GATE — cheap pre-checks so we don't burn tokens on PRs we
+  # don't want to review:
+  #   • skip drafts (configurable)
+  #   • skip bot authors (dependabot, renovate, etc.)
+  #   • skip oversized PRs (configurable threshold)
+  # Outputs `should_review` consumed by the review job.
+  # ───────────────────────────────────────────────────────────
+  gate:
+    name: Should review?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_review: ${{ steps.decide.outputs.should_review }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          SKIP_DRAFTS: ${{ inputs.skip_drafts }}
+          MAX_FILES: ${{ inputs.max_changed_files }}
+        run: |
+          set -euo pipefail
+
+          emit() {
+            echo "should_review=$1" >> "$GITHUB_OUTPUT"
+            echo "reason=$2"        >> "$GITHUB_OUTPUT"
+            echo "Decision: $1 ($2)"
+          }
+
+          if [ "${SKIP_DRAFTS}" = "true" ] && [ "${IS_DRAFT}" = "true" ]; then
+            emit "false" "PR is a draft"; exit 0
+          fi
+
+          if [ "${AUTHOR_TYPE}" = "Bot" ]; then
+            emit "false" "Author ${AUTHOR} is a bot"; exit 0
+          fi
+
+          if [ "${MAX_FILES}" != "0" ]; then
+            CHANGED=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json changedFiles -q .changedFiles)
+            if [ "${CHANGED}" -gt "${MAX_FILES}" ]; then
+              emit "false" "PR changes ${CHANGED} files (> ${MAX_FILES})"; exit 0
+            fi
+          fi
+
+          emit "true" "ok"
+
+  # ───────────────────────────────────────────────────────────
+  # REVIEW — runs Claude Code against the PR with a checklist
+  # tuned to the project type. The action picks up PR context
+  # (head SHA, base, changed files) automatically from the
+  # pull_request event and posts inline + sticky comments.
+  # ───────────────────────────────────────────────────────────
+  review:
+    name: Claude review
+    needs: gate
+    if: needs.gate.outputs.should_review == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate project_type
+        env:
+          PROJECT_TYPE: ${{ inputs.project_type }}
+        run: |
+          case "${PROJECT_TYPE}" in
+            capacitor|unity) ;;
+            *) echo "::error::project_type must be 'capacitor' or 'unity' (got '${PROJECT_TYPE}')"; exit 1 ;;
+          esac
+
+      - name: Build review prompt
+        id: prompt
+        env:
+          PROJECT_TYPE: ${{ inputs.project_type }}
+          EXTRA: ${{ inputs.extra_instructions }}
+        run: |
+          set -euo pipefail
+
+          # Shared header — keeps reviews focused on real bugs, not style.
+          COMMON='You are reviewing a pull request. Be a senior engineer doing a code review, not a linter.
+
+          Rules of engagement:
+          - Read enough surrounding code to understand each change in context. Use the file tools.
+          - Post inline comments on specific lines for concrete issues only.
+          - End with ONE sticky summary comment: overall verdict (approve / request changes / comment) + a short bullet list of the top issues, if any.
+          - Do not comment on formatting, naming preferences, or "nice to have" refactors. The CI lints code.
+          - Do not restate what the diff does. Assume the author can read their own code.
+          - If the PR looks good, say so plainly in the summary and post no inline comments.
+          - Severity tags on inline comments: [BUG], [SECURITY], [PERF], [CRASH-RISK], [LOGIC]. Skip anything that does not deserve one of these tags.
+          - Flag AI-generated tells: invented APIs, wrong import paths, plugins that do not exist on the target platform, copy-pasted code that references the wrong variable.
+
+          What to look for:'
+
+          if [ "${PROJECT_TYPE}" = "capacitor" ]; then
+            CHECKLIST='
+          React / Vite:
+          - Stale closures and missing useEffect dependencies (or unnecessary deps causing re-render loops).
+          - Conditional hook calls, hooks inside loops/callbacks.
+          - Missing or non-unique `key` props on lists.
+          - Unhandled promise rejections; async work in components without cleanup on unmount.
+          - State that should be derived (useMemo) recomputed on every render unnecessarily, OR memoization that hides real bugs.
+          - Direct DOM access that breaks in the WebView (document.fullscreenElement, window.open, etc.).
+
+          Capacitor / mobile:
+          - Native plugins called before WebView is ready (call inside an effect, not at module scope).
+          - Missing platform guards (Capacitor.getPlatform() / Capacitor.isNativePlatform()) when web fallback differs.
+          - Permissions used in code but not declared in AndroidManifest.xml or Info.plist.
+          - Hardware back button on Android not handled (App.addListener("backButton")).
+          - Touch vs mouse event mismatches; click handlers that do not fire on iOS Safari/WKWebView.
+          - Safe-area insets ignored on notched devices (env(safe-area-inset-*) or Capacitor StatusBar).
+          - Splash / status bar API misuse (calling .hide() before plugin is available).
+          - Storage: localStorage assumed persistent across app updates (it is on iOS WKWebView but only with WKWebView, double-check).
+          - Heavy synchronous work on the main thread blocking the WebView.
+
+          Game-specific:
+          - requestAnimationFrame loops without cancellation on unmount.
+          - Audio playback assuming user gesture has happened.
+          - Canvas/WebGL context leaks when navigating between scenes.
+
+          Build / config:
+          - capacitor.config.ts changes that break iOS or Android builds (server.url left in for prod, allowMixedContent without TLS plan).
+          - package.json: new native dependencies added without running `npx cap sync`.'
+          else
+            CHECKLIST='
+          C# / Unity API:
+          - UnityEngine.Object null check using `?.` or `??` (these bypass Unity overloaded `==` and lie about destroyed objects). Use `if (obj == null)` or `if (!obj)` for Unity objects.
+          - Coroutines started on disabled or about-to-be-destroyed GameObjects (they will silently stop).
+          - `Destroy()` on prefab assets vs instances; `DestroyImmediate` outside editor code.
+          - `GetComponent`, `FindObjectOfType`, `GameObject.Find` inside `Update` / hot paths.
+          - `Instantiate` in a loop without an object pool for spawners/bullets/particles.
+          - Event subscribers added in `OnEnable` but not removed in `OnDisable` (memory leak + double-fire on re-enable).
+          - `async void` methods (use `async Task` or UniTask; `async void` swallows exceptions).
+          - LINQ allocations in `Update` (Where/Select/ToList) — performance death on mobile.
+          - `string` concatenation in `Update` instead of StringBuilder / cached strings.
+          - Boxing in hot paths (struct passed as `object`, struct in generic with reference constraint).
+
+          Lifecycle:
+          - `Awake` vs `Start` mismatch (Awake runs before all Starts; do not reference other components in Awake unless ordered).
+          - `OnDestroy` missing cleanup for static event handlers, native handles, AsyncOperationHandles (Addressables).
+          - ScriptableObject mutated at runtime persists into the editor and across play sessions — usually a bug.
+
+          Mobile:
+          - `Input.GetMouseButton` used where `Input.touchCount` / new Input System is needed.
+          - `Application.targetFrameRate` not set (mobile defaults to 30 on iOS, can vary on Android).
+          - Texture/audio import settings not appropriate for mobile (uncompressed, max size too high).
+          - `Resources.Load` (or large Resources folder) — increases startup time and memory baseline.
+
+          AI hallucinations to flag:
+          - Calls to APIs that do not exist on the target Unity version (e.g. `Object.FindFirstObjectByType` on 2021.x).
+          - Deprecated patterns: `UnityWebRequest.Get(...).downloadHandler.data` without awaiting, `WWW`, old animation API.
+          - Made-up package names in Packages/manifest.json.
+
+          Build / config:
+          - ProjectSettings changes that affect store submission (bundle id, version, target SDK) without intent.
+          - Scenes added/removed from Build Settings without matching code changes.'
+          fi
+
+          # Compose final prompt. Heredoc with quoted EOF preserves $ verbatim.
+          {
+            echo "${COMMON}"
+            echo "${CHECKLIST}"
+            if [ -n "${EXTRA}" ]; then
+              echo ""
+              echo "Additional instructions for this repo:"
+              echo "${EXTRA}"
+            fi
+            echo ""
+            echo "When done, post exactly one sticky summary comment. Inline comments only for things tagged [BUG], [SECURITY], [PERF], [CRASH-RISK], or [LOGIC]."
+          } > /tmp/review_prompt.txt
+
+          echo "Prompt size: $(wc -c </tmp/review_prompt.txt) bytes"
+          # Expose path for next step
+          echo "path=/tmp/review_prompt.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Read prompt into env
+        id: read_prompt
+        run: |
+          {
+            echo 'PROMPT<<PROMPT_EOF'
+            cat /tmp/review_prompt.txt
+            echo 'PROMPT_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Run Claude review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: --model ${{ inputs.model }}
+          use_sticky_comment: true
+          prompt: ${{ env.PROMPT }}

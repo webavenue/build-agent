@@ -1,12 +1,15 @@
 # build-agent
 
-Reusable GitHub Actions workflow repo for building and releasing **Capacitor** (React + Capacitor) apps to Google Play and TestFlight. Also used for Unity game projects. Workflows are designed to be **called** from individual project repos via `workflow_call`, not triggered directly in this repo.
+Reusable GitHub Actions workflow repo for building and releasing **Capacitor** (React + Capacitor) apps to Google Play and TestFlight. Also used for Unity game projects, plus a shared **automated PR reviewer** for both stacks. Workflows are designed to be **called** from individual project repos via `workflow_call`, not triggered directly in this repo.
 
 ## Repo structure
 
 ```
 .github/workflows/capacitor.yml             # Reusable workflow for Capacitor apps (GitHub-hosted runners)
 .github/workflows/capacitor-selfhosted.yml  # Same workflow but for self-hosted Mac mini (Android + iOS sequential, automatic iOS signing)
+.github/workflows/unity.yml                 # Reusable workflow for Unity projects (cloud)
+.github/workflows/unity-selfhosted.yml      # Unity workflow on the self-hosted Mac mini
+.github/workflows/claude-review.yml         # Reusable automated PR reviewer (Claude Code Action), tuned per project_type
 docs/self-hosted-setup.md                   # Runbook for installing the Mac mini runner + Fastfile changes
 scripts/push-secrets.sh                     # Pushes secrets/variables to target GitHub repos via gh CLI
 .secrets.env.example                        # Combined template for shared + project-specific values
@@ -92,6 +95,53 @@ DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
 - **Version code formula:** `version_code_offset + github.run_number`. Set different offsets per project to prevent collisions when multiple projects share the same workflow.
 - **Notifications:** After both Android and iOS jobs finish, a notify job creates Asana QA tasks and posts a Slack message with build status, download links, and release notes. Notify always runs on ubuntu-latest (both variants).
 - **Failure diagnosis:** On Android or iOS failure, the notify job pulls the failed-step logs via `gh run view --log-failed`, asks Claude Haiku 4.5 for a 2–4 sentence plain-English diagnosis, and posts it as a threaded reply to the Slack failure message. Requires `ANTHROPIC_API_KEY` on the caller repo; silently skipped if absent. Needs `actions: read` permission on the notify job (already declared).
+
+## Automated PR review (claude-review.yml)
+
+Reusable workflow that runs `anthropics/claude-code-action@v1` on each PR with a checklist tuned to the project stack. Designed to be the first reviewer on AI-generated game code — it catches the failure modes humans skim past (invented APIs, stale-closure bugs, missing Capacitor permissions, Unity null-check traps).
+
+### Caller usage
+
+```yaml
+# In <game-repo>/.github/workflows/pr-review.yml
+name: PR Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  review:
+    uses: webavenue/build-agent/.github/workflows/claude-review.yml@main
+    with:
+      project_type: capacitor   # or "unity"
+    secrets: inherit
+```
+
+### Inputs
+| Input | Default | Description |
+|---|---|---|
+| `project_type` | _required_ | `"capacitor"` or `"unity"` — selects the review checklist |
+| `model` | `claude-sonnet-4-6` | Anthropic model id. Use `claude-opus-4-7` for deeper review at ~5x the cost. |
+| `max_changed_files` | `80` | Skip review when the PR touches more files than this (cost guard). `0` disables. |
+| `skip_drafts` | `true` | Don't review draft PRs. |
+| `extra_instructions` | `""` | Extra prompt text appended to the checklist (e.g. "Pay extra attention to the new payments flow."). |
+
+### What the checklists cover
+
+- **Capacitor:** React/Vite footguns (stale useEffect deps, conditional hooks, missing keys), Capacitor lifecycle/permission issues, mobile WebView quirks (touch vs mouse, safe areas, Android back button), game-loop leaks (rAF, audio, WebGL), and AI hallucinations (invented plugins/APIs).
+- **Unity:** Unity `Object` null pitfalls (`?.` lies about destroyed objects), coroutine/lifecycle leaks, hot-path allocations (LINQ in Update, boxing, GetComponent), event subscription leaks, mobile input/perf settings, and AI hallucinations (deprecated/nonexistent APIs).
+
+Both checklists explicitly tell Claude **not** to comment on style, naming, or "nice to haves" — only `[BUG]`, `[SECURITY]`, `[PERF]`, `[CRASH-RISK]`, or `[LOGIC]` issues earn inline comments. Everything else goes into a single sticky summary comment.
+
+### Requirements on the caller repo
+
+- `ANTHROPIC_API_KEY` secret (same one used by build-failure diagnosis — push via `push-secrets.sh`).
+- No additional permissions config — the reusable workflow declares `pull-requests: write` and `issues: write` itself.
+
+### Cost notes
+
+- Sonnet 4.6 on a typical 5–20 file PR runs ~$0.05–$0.30. Opus 4.7 is ~5x. The `max_changed_files` guard short-circuits unusually large PRs (vendored asset commits, generated code) before any tokens are spent.
+- Bot authors (dependabot, renovate) are skipped automatically.
 
 ## Self-hosted Mac mini — non-obvious gotchas
 
