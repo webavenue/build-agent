@@ -346,10 +346,10 @@ jobs:
           fi
 
       - name: Install npm dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts=false
 
       - name: Build React app
-        run: npm run build
+        run: npm run build --ignore-scripts=false
 
       - name: Capacitor sync
         run: npx cap sync android
@@ -496,10 +496,10 @@ jobs:
           echo "✓ Profile installed: $PROFILE_NAME ($PROFILE_UUID)"
 
       - name: Install npm dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts=false
 
       - name: Build React app
-        run: npm run build
+        run: npm run build --ignore-scripts=false
 
       - name: Capacitor sync
         run: npx cap sync ios

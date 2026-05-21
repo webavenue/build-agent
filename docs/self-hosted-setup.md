@@ -39,6 +39,14 @@ echo 'export JAVA_HOME=$(/usr/libexec/java_home -v 21)' >> ~/.zshrc
 source ~/.zshrc
 ```
 
+**Ensure npm lifecycle scripts are enabled.** If `npm config get ignore-scripts` returns `true`, npm silently skips *all* lifecycle scripts — `prebuild`/`postbuild`, `postinstall` during `npm ci`, everything. Capacitor projects often rely on these hooks to fetch assets not committed to git (e.g. an `ensure:tiles` prebuild step), so a `true` here produces builds that are missing assets with no error in the log. Force it off:
+
+```bash
+npm config set ignore-scripts false   # must be false; verify with: npm config get ignore-scripts
+```
+
+The Capacitor workflows also pass `--ignore-scripts=false` on `npm ci` and `npm run build` as a belt-and-suspenders guard, but set the host config too so any manual `npm` runs on the box behave the same.
+
 ## 2. Android SDK
 
 The cloud workflow uses `actions/setup-java`, which auto-installs the Android SDK. On self-hosted, you install it manually once.
@@ -394,6 +402,13 @@ cd /Users/ava/actions-runners/<repo>
 ./svc.sh stop
 ./svc.sh start
 ```
+
+### Build succeeds but the app is missing assets (e.g. world map / tiles) at runtime
+npm lifecycle scripts are being skipped. Run `npm config get ignore-scripts` on the Mac mini — if it returns `true`, npm silently skips `prebuild`/`postbuild` (and `postinstall` during `npm ci`), so any hook that fetches uncommitted assets never runs and the build ships incomplete with no error. Fix:
+```bash
+npm config set ignore-scripts false   # verify: npm config get ignore-scripts → false
+```
+The Capacitor workflows already pass `--ignore-scripts=false` on `npm ci`/`npm run build`, so this only bites manual `npm` runs or older workflow revisions — but keep the host config off regardless. See §1.
 
 ### iOS codesign fails with `errSecInternalComponent` on the first 1–2 frameworks
 Either the partition list wasn't set or the keychain unlock step is skipping. Verify:

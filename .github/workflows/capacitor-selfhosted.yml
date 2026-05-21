@@ -335,10 +335,10 @@ jobs:
         run: bundle install --jobs 3
 
       - name: Install npm dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts=false
 
       - name: Build React app
-        run: npm run build
+        run: npm run build --ignore-scripts=false
 
       - name: Capacitor sync
         run: npx cap sync android
@@ -450,10 +450,10 @@ jobs:
         run: bundle install --jobs 3
 
       - name: Install npm dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts=false
 
       - name: Build React app
-        run: npm run build
+        run: npm run build --ignore-scripts=false
 
       - name: Capacitor sync
         run: npx cap sync ios
