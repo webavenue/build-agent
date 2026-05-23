@@ -529,6 +529,8 @@ jobs:
       inputs.action == 'build + upload' &&
       needs.android.result != 'cancelled'
     runs-on: [self-hosted, macOS, ARM64]
+    outputs:
+      version_code: ${{ steps.version.outputs.code }}
 
     steps:
 
@@ -558,13 +560,6 @@ jobs:
           echo "── Code-signing identities ──"
           security find-identity -v -p codesigning || true
 
-      - name: Compute version code
-        id: version
-        run: |
-          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
-          echo "code=$CODE" >> $GITHUB_OUTPUT
-          echo "Version code will be: $CODE"
-
       - name: Decode Apple API key
         run: |
           mkdir -p ci-certs
@@ -572,6 +567,41 @@ jobs:
 
       - name: Install gems
         run: bundle install --jobs 3
+
+      # Mirrors the Android `fetch_next_version_code` step: invoke the shared
+      # Fastfile lane that queries App Store Connect for the latest TestFlight
+      # build number and writes max+1 to a file. Fall back to `offset+run_number`
+      # if the lane is missing or the API call fails (lets older callers keep
+      # working without forcing the shared Fastfile on them).
+      - name: Compute version code
+        id: version
+        env:
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          APPLE_API_KEY_PATH: ${{ github.workspace }}/ci-certs/apple-api-key.p8
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          NEXT_BUILD_NUMBER_FILE: ${{ github.workspace }}/next_build_number.txt
+          CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
+        run: |
+          FALLBACK_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+
+          echo "→ Attempting to derive build number from TestFlight…"
+          set +e
+          bundle exec fastlane ios fetch_next_build_number
+          LANE_EXIT=$?
+          set -e
+
+          if [ "$LANE_EXIT" -eq 0 ] && [ -s "$NEXT_BUILD_NUMBER_FILE" ]; then
+            CODE=$(cat "$NEXT_BUILD_NUMBER_FILE")
+            echo "✓ TestFlight-derived build number: $CODE"
+          else
+            echo "⚠ fetch_next_build_number lane failed (exit=$LANE_EXIT) or wrote no output."
+            echo "  Falling back to offset+run_number: $FALLBACK_CODE"
+            CODE="$FALLBACK_CODE"
+          fi
+
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "Build number will be: $CODE"
 
       - name: Install npm dependencies
         run: npm ci --ignore-scripts=false
@@ -726,8 +756,8 @@ jobs:
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
           BRANCH: ${{ github.ref_name }}
+          VERSION_CODE: ${{ needs.ios.outputs.version_code }}
         run: |
-          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
           TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [iOS] ${VERSION_CODE}(${VERSION_NAME}) QA"
           echo "Creating Asana task: $TASK_NAME"
 
@@ -790,13 +820,25 @@ jobs:
           IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
+          IOS_VERSION_CODE: ${{ needs.ios.outputs.version_code }}
         run: |
-          # Prefer the Android-derived code (Play-fetched or fallback); otherwise
-          # use the legacy formula for iOS-only builds.
-          if [ -n "$ANDROID_VERSION_CODE" ]; then
+          # Build a compact version display. Android and iOS build numbers
+          # diverge now (each platform fetches max+1 from its own store), so
+          # show both when present; otherwise show whichever exists, falling
+          # back to the legacy formula if neither is available.
+          FALLBACK_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          if [ -n "$ANDROID_VERSION_CODE" ] && [ -n "$IOS_VERSION_CODE" ]; then
+            VERSION_DISPLAY="${VERSION_NAME} (Android ${ANDROID_VERSION_CODE} · iOS ${IOS_VERSION_CODE})"
             VERSION_CODE="$ANDROID_VERSION_CODE"
+          elif [ -n "$ANDROID_VERSION_CODE" ]; then
+            VERSION_DISPLAY="${VERSION_NAME} (${ANDROID_VERSION_CODE})"
+            VERSION_CODE="$ANDROID_VERSION_CODE"
+          elif [ -n "$IOS_VERSION_CODE" ]; then
+            VERSION_DISPLAY="${VERSION_NAME} (${IOS_VERSION_CODE})"
+            VERSION_CODE="$IOS_VERSION_CODE"
           else
-            VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+            VERSION_DISPLAY="${VERSION_NAME} (${FALLBACK_CODE})"
+            VERSION_CODE="$FALLBACK_CODE"
           fi
           ANDROID_RESULT="${{ needs.android.result }}"
           IOS_RESULT="${{ needs.ios.result }}"
@@ -830,9 +872,9 @@ jobs:
 
           if [ "$ALL_SUCCESS" = "true" ]; then
             if [ "$ACTION" = "build only" ]; then
-              MESSAGE=$(printf '%b' "Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_")
+              MESSAGE=$(printf '%b' "Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_DISPLAY}\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_")
             else
-              MESSAGE=$(printf '%b' "Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}")
+              MESSAGE=$(printf '%b' "Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_DISPLAY}\n:herb: Branch: ${BRANCH}\n:memo: Release Details\n${RELEASE_NOTES}")
 
               if [ "$ANDROID_RESULT" = "success" ]; then
                 if [ -n "$SLACK_ANDROID_DOWNLOAD_URL" ]; then
@@ -854,7 +896,7 @@ jobs:
               fi
             fi
           else
-            MESSAGE=$(printf '%b' "Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>")
+            MESSAGE=$(printf '%b' "Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_DISPLAY}\n:herb: Branch: ${BRANCH}\n:mag: <${RUN_URL}|View logs>")
           fi
 
           REQUEST=$(jq -n \
@@ -978,11 +1020,18 @@ jobs:
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
           ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
+          IOS_VERSION_CODE: ${{ needs.ios.outputs.version_code }}
         run: |
           set -euo pipefail
 
+          # Tag with whatever build code we have. Prefer Android (most common),
+          # fall back to iOS, then to the legacy formula. The two stores' codes
+          # diverge, so the tag is just for traceability — not a guarantee both
+          # platforms shipped the same number.
           if [ -n "$ANDROID_VERSION_CODE" ]; then
             VERSION_CODE="$ANDROID_VERSION_CODE"
+          elif [ -n "$IOS_VERSION_CODE" ]; then
+            VERSION_CODE="$IOS_VERSION_CODE"
           else
             VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
           fi

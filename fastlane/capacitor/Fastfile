@@ -193,6 +193,31 @@ platform :ios do
     )
   end
 
+  desc "Fetch max TestFlight build number, +1, write to NEXT_BUILD_NUMBER_FILE (or next_build_number.txt)"
+  lane :fetch_next_build_number do
+    setup_api_key
+    next_num = 1
+    begin
+      # No `version` arg → returns max build number across ALL versions on
+      # TestFlight (not just the current version_name). This gives us a
+      # monotonically increasing CFBundleVersion that Apple always accepts,
+      # regardless of how the version_name moves.
+      latest = latest_testflight_build_number(
+        app_identifier:        ENV["IOS_BUNDLE_ID"],
+        initial_build_number:  0,
+      )
+      next_num = latest.to_i + 1
+      UI.success("Latest TestFlight build number: #{latest} → next: #{next_num}")
+    rescue => e
+      # App not yet on TestFlight, transient API error, etc. — start at 1.
+      UI.important("Could not fetch latest TestFlight build (#{e.class}: #{e.message}). Falling back to 1.")
+    end
+
+    out_file = ENV["NEXT_BUILD_NUMBER_FILE"] || File.expand_path("next_build_number.txt")
+    File.write(out_file, next_num.to_s)
+    UI.message("Wrote #{next_num} to #{out_file}")
+  end
+
   desc "Download AppLovin Quality Service (Ad Review) xcframework if missing"
   private_lane :ensure_applovin_quality_service do
     ios_dir = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App'))
