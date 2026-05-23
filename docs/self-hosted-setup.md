@@ -219,18 +219,13 @@ On GitHub: runner page shows a green dot, status "Idle".
 
 ## 7. Caller repo changes
 
-### 7a. Switch the workflow `uses:` line
+### 7a. Workflow `uses:` line
 
 In the caller repo's `.github/workflows/build.yml`:
 
 ```yaml
-# Was:
-uses: webavenue/build-agent/.github/workflows/capacitor.yml@main
-# To:
 uses: webavenue/build-agent/.github/workflows/capacitor-selfhosted.yml@main
 ```
-
-Other inputs and `secrets: inherit` stay the same.
 
 ### 7b. Add `MAC_LOGIN_PASSWORD` secret
 
@@ -241,80 +236,38 @@ In the caller repo settings → Secrets and variables → Actions → New reposi
 
 The iOS job uses this to run `security unlock-keychain` before xcodebuild, which prevents `errSecInternalComponent` on the first codesign calls. Without it, the workflow will print a warning and continue — and likely fail at codesign on the first 1–2 frameworks.
 
-### 7c. Unused secrets (safe to leave or remove)
+### 7c. Obsolete secrets (safe to remove)
 
-These cloud-only secrets aren't used by the self-hosted workflow:
+These secrets are no longer used by the workflow — the dist cert lives in the host login keychain and sigh fetches the provisioning profile via the API key:
 
-- `APPLE_DIST_CERT_BASE64` — cert lives in the host login keychain
-- `APPLE_DIST_CERT_PASSWORD` — same
-- `APPLE_PROVISIONING_PROFILE_BASE64` — profile is fetched by sigh via the API key
+- `APPLE_DIST_CERT_BASE64`
+- `APPLE_DIST_CERT_PASSWORD`
+- `APPLE_PROVISIONING_PROFILE_BASE64`
+- `IOS_PROVISIONING_PROFILE_NAME`
 
-Leave them in place if you might switch back to the cloud workflow, or delete them to declutter.
+Delete them to declutter or leave in place — they're ignored either way.
 
-### 7d. Add `ship_auto` lane to the Fastfile
+### 7d. Use the shared Fastfile via `import_from_git`
 
-The self-hosted iOS job calls `bundle exec fastlane ios ship_auto`. Add this next to the existing `ship` lane in `fastlane/Fastfile`:
+All Fastlane lanes (`ship`, `ship_auto`, `build_apk`, `fetch_next_version_code`, etc.) live in this repo at `fastlane/capacitor/Fastfile`. Caller repos pull them in:
 
 ```ruby
-desc "Fetch/refresh Distribution profile via sigh, then patch App target to manual signing with it"
-private_lane :set_ios_signing_sigh do
-  # sigh uses the API key (set up by setup_api_key) to create or refresh
-  # an App Store distribution profile, downloaded + installed locally.
-  # No .mobileprovision secret needed — Apple manages it, sigh fetches it.
-  get_provisioning_profile(
-    app_identifier: ENV["IOS_BUNDLE_ID"],
-    development:    false,    # We want a distribution profile
-    force:          false,    # Reuse existing if still valid
-  )
+# In <caller-repo>/fastlane/Fastfile
+require 'dotenv'
+Dotenv.load('../.env')
 
-  xcodeproj = File.expand_path(File.join(ENV["CAPACITOR_PROJECT_PATH"], "ios/App/App.xcodeproj"))
-  update_code_signing_settings(
-    use_automatic_signing: false,   # Must be manual — automatic always picks dev profile for archive
-    path:                  xcodeproj,
-    targets:               ["App"], # Only the App target — leaves Pods/SPM untouched
-    team_id:               ENV["APPLE_TEAM_ID"],
-    code_sign_identity:    "Apple Distribution",
-    profile_name:          lane_context[SharedValues::SIGH_NAME],
-    bundle_identifier:     ENV["IOS_BUNDLE_ID"],
-  )
-end
+default_platform(:ios)
 
-desc "Build a signed iOS IPA on the self-hosted Mac runner — profile fetched via sigh, cert from host keychain"
-private_lane :build_auto do
-  set_ios_version
-  setup_api_key
-  set_ios_signing_sigh
-  ensure_applovin_quality_service     # Or your project's equivalent if you have one
-  workspace = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App/App.xcworkspace'))
-  project   = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App/App.xcodeproj'))
-  gym(
-    scheme:           ENV["IOS_SCHEME"] || "App",
-    workspace:        File.exist?(workspace) ? workspace : nil,
-    project:          File.exist?(workspace) ? nil : project,
-    configuration:    "Release",
-    output_directory: "./build_output",
-    clean:            true,
-    export_options: {
-      method:               "app-store",
-      signingStyle:         "manual",
-      signingCertificate:   "Apple Distribution",
-      teamID:               ENV["APPLE_TEAM_ID"],
-      provisioningProfiles: {
-        ENV["IOS_BUNDLE_ID"] => lane_context[SharedValues::SIGH_NAME],
-      },
-    },
-  )
-end
+import_from_git(
+  url:    'https://github.com/webavenue/build-agent',
+  branch: 'main',                                # or `tag: 'capacitor-v1'`
+  path:   'fastlane/capacitor/Fastfile',
+)
 
-desc "Build + Upload to TestFlight (self-hosted Mac runner)"
-lane :ship_auto do
-  build_auto
-  upload
-  notify_success("iOS")
-end
+# Project-specific overrides (if any) go below the import.
 ```
 
-The Xcode project's `CODE_SIGN_STYLE` can stay `Automatic` (the default after Capacitor scaffolding) — `set_ios_signing_sigh` patches the App target to manual at build time and leaves Pods/SPM packages on their defaults.
+Per-repo files that stay alongside: `Gemfile`, `Gemfile.lock`, `fastlane/Appfile`, `fastlane/Pluginfile`. Edit the shared lanes in this repo, not in callers.
 
 ## 8. First-build smoke test
 
@@ -326,10 +279,6 @@ The Xcode project's `CODE_SIGN_STYLE` can stay `Automatic` (the default after Ca
    ```
 
 Once Android + iOS both ship green, the runner is ready.
-
-## 9. Switching back to cloud builds
-
-Change the caller repo's `uses:` line back to `capacitor.yml@main`. No other changes — the original `ship` lane is untouched, secrets are still in place.
 
 ---
 

@@ -1,22 +1,25 @@
 name: Capacitor Build (Self-Hosted, Reusable)
 
 # ─────────────────────────────────────────────────────────────
-# REUSABLE WORKFLOW — self-hosted Mac mini variant.
+# REUSABLE WORKFLOW — self-hosted Mac mini.
 #
-# Differences from capacitor.yml:
-#   • Both Android and iOS run on the same Mac mini, sequentially
-#     (Android → iOS) to avoid OOM contention on 16GB RAM.
-#   • Tool setup actions (setup-java/node/ruby/xcode) are dropped —
-#     host tools are used directly. See docs/self-hosted-setup.md
-#     for required versions.
-#   • iOS uses automatic signing via App Store Connect API key
-#     (xcodebuild -allowProvisioningUpdates). The dist cert lives
-#     in the host login keychain. No cert decode, no temp keychain,
-#     no provisioning profile install step.
-#   • iOS calls fastlane lane `ship_auto` (not `ship`). Caller repos
-#     must add this lane — see docs/self-hosted-setup.md.
+# Both Android and iOS run on the same Mac mini, sequentially
+# (Android → iOS) to avoid OOM contention on 16GB RAM. Tools are
+# pre-installed on the host — see docs/self-hosted-setup.md for
+# required versions.
 #
-# changelog + notify jobs still run on ubuntu-latest (no benefit
+# iOS signing: sigh fetches a Distribution profile via the App
+# Store Connect API key at build time, then the App target is
+# patched to manual signing with that profile. The dist cert
+# lives in the host login keychain. No cert decode, no temp
+# keychain, no .mobileprovision secret.
+#
+# Fastlane lanes (`ship_auto`, `ship`, `fetch_next_version_code`,
+# `build_apk`, etc.) live in build-agent/fastlane/capacitor/Fastfile
+# and are pulled into caller repos via `import_from_git`. See
+# CLAUDE.md → "Shared Fastlane lanes" for the caller Fastfile stub.
+#
+# The changelog + notify jobs still run on ubuntu-latest (no benefit
 # to self-hosting them, and it frees the Mac mini for build jobs).
 # ─────────────────────────────────────────────────────────────
 on:
@@ -69,8 +72,8 @@ on:
 jobs:
 
   # ───────────────────────────────────────────────────────────
-  # CHANGELOG — identical to capacitor.yml. Stays on ubuntu-latest
-  # since it's just curl/jq/gh/git and frees the Mac mini for builds.
+  # CHANGELOG — stays on ubuntu-latest since it's just curl/jq/gh/git
+  # and frees the Mac mini for builds.
   # ───────────────────────────────────────────────────────────
   changelog:
     name: Generate changelog
@@ -257,6 +260,8 @@ jobs:
     needs: changelog
     if: ${{ inputs.build_android }}
     runs-on: [self-hosted, macOS, ARM64]
+    outputs:
+      version_code: ${{ steps.version.outputs.code }}
 
     steps:
 
@@ -286,13 +291,6 @@ jobs:
           npm --version
           ruby --version
           bundle --version
-
-      - name: Compute version code
-        id: version
-        run: |
-          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
-          echo "code=$CODE" >> $GITHUB_OUTPUT
-          echo "Version code will be: $CODE"
 
       - name: Decode keystore
         run: |
@@ -333,6 +331,39 @@ jobs:
 
       - name: Install gems
         run: bundle install --jobs 3
+
+      # The shared Fastfile (build-agent/fastlane/capacitor/Fastfile, imported
+      # by the caller via `import_from_git`) defines `fetch_next_version_code`,
+      # which queries Play's internal track and returns max+1. We auto-detect
+      # the lane and fall back to `version_code_offset + run_number` only if it's
+      # missing — protects callers that haven't migrated to the shared Fastfile yet.
+      - name: Compute version code
+        id: version
+        env:
+          ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
+          GOOGLE_PLAY_JSON_KEY_PATH: ${{ github.workspace }}/ci-certs/google-play-key.json
+          NEXT_VERSION_CODE_FILE: ${{ github.workspace }}/next_version_code.txt
+          CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
+        run: |
+          set -e
+          FALLBACK_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+
+          if bundle exec fastlane lanes 2>/dev/null | grep -qE '^\s*android\s+fetch_next_version_code'; then
+            echo "✓ Caller Fastfile defines android.fetch_next_version_code — querying Play internal track"
+            if bundle exec fastlane android fetch_next_version_code && [ -s "$NEXT_VERSION_CODE_FILE" ]; then
+              CODE=$(cat "$NEXT_VERSION_CODE_FILE")
+              echo "✓ Play-derived version code: $CODE"
+            else
+              echo "⚠ fetch_next_version_code lane failed — falling back to offset+run_number ($FALLBACK_CODE)"
+              CODE="$FALLBACK_CODE"
+            fi
+          else
+            echo "ℹ Caller Fastfile has no fetch_next_version_code lane — using offset+run_number ($FALLBACK_CODE)"
+            CODE="$FALLBACK_CODE"
+          fi
+
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "Version code will be: $CODE"
 
       - name: Install npm dependencies
         run: npm ci --ignore-scripts=false
@@ -487,10 +518,11 @@ jobs:
           security set-keychain-settings ~/Library/Keychains/login.keychain-db
           echo "✓ Login keychain unlocked"
 
-      # Calls `ship_auto` — a new lane caller repos must add. It uses
-      # automatic signing via -allowProvisioningUpdates + the App Store
-      # Connect API key (no manual signing patch, no profile install).
-      # The host's login keychain provides the dist cert.
+      # Calls `ship_auto` — defined in build-agent/fastlane/capacitor/Fastfile,
+      # imported by the caller's Fastfile via `import_from_git`. Uses sigh to
+      # fetch a Distribution profile (via App Store Connect API key), then
+      # archives with manual signing using that profile. The host's login
+      # keychain provides the dist cert.
       - name: Run fastlane ios ship_auto
         timeout-minutes: 45
         env:
@@ -510,7 +542,7 @@ jobs:
 
 
   # ───────────────────────────────────────────────────────────
-  # NOTIFY — identical to capacitor.yml. Stays on ubuntu-latest.
+  # NOTIFY — stays on ubuntu-latest.
   # ───────────────────────────────────────────────────────────
   notify:
     name: Notify
@@ -539,8 +571,8 @@ jobs:
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
           BRANCH: ${{ github.ref_name }}
+          VERSION_CODE: ${{ needs.android.outputs.version_code }}
         run: |
-          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
           TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [Android] ${VERSION_CODE}(${VERSION_NAME}) QA"
           echo "Creating Asana task: $TASK_NAME"
 
@@ -664,8 +696,15 @@ jobs:
           ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
           IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
         run: |
-          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          # Prefer the Android-derived code (Play-fetched or fallback); otherwise
+          # use the legacy formula for iOS-only builds.
+          if [ -n "$ANDROID_VERSION_CODE" ]; then
+            VERSION_CODE="$ANDROID_VERSION_CODE"
+          else
+            VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          fi
           ANDROID_RESULT="${{ needs.android.result }}"
           IOS_RESULT="${{ needs.ios.result }}"
           ACTION="${{ inputs.action }}"
@@ -845,10 +884,15 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION_NAME: ${{ inputs.version_name }}
           RELEASE_NOTES: ${{ needs.changelog.outputs.qa_notes }}
+          ANDROID_VERSION_CODE: ${{ needs.android.outputs.version_code }}
         run: |
           set -euo pipefail
 
-          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          if [ -n "$ANDROID_VERSION_CODE" ]; then
+            VERSION_CODE="$ANDROID_VERSION_CODE"
+          else
+            VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          fi
           TAG="build-${VERSION_CODE}"
           TITLE="Build ${VERSION_CODE} — v${VERSION_NAME}"
 

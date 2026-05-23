@@ -1,11 +1,26 @@
-# Fastlane Fastfile — Infinity Games Build Agent
-# Docs: https://docs.fastlane.tools
-
-# Load .env automatically
-require 'dotenv'
-Dotenv.load('../.env')
-
-default_platform(:ios)
+# Fastlane Fastfile — SHARED Capacitor lanes (Infinity Games Build Agent)
+#
+# This file is imported into caller-repo Fastfiles via `import_from_git`:
+#
+#   import_from_git(
+#     url:    'https://github.com/webavenue/build-agent',
+#     branch: 'main',                                   # or tag: 'v1.0.0'
+#     path:   'fastlane/capacitor/Fastfile',
+#   )
+#
+# Caller responsibilities (kept per-repo, not centralised):
+#   • Gemfile / Gemfile.lock — pins fastlane gem version
+#   • fastlane/Appfile        — project-specific app_identifier / package_name
+#   • fastlane/Pluginfile     — any per-project plugins
+#   • fastlane/Fastfile       — `require 'dotenv'` + `Dotenv.load('../.env')`
+#                               + `default_platform(:ios)` + the import_from_git
+#
+# iOS signing model:
+#   This file assumes the self-hosted Mac mini setup where the distribution
+#   cert lives in the host login keychain and `sigh` (via App Store Connect
+#   API key) fetches/refreshes the provisioning profile at build time. There
+#   is NO manual-signing path here — `IOS_PROVISIONING_PROFILE_NAME` is not
+#   consumed anywhere in this file. Caller workflows call `ship_auto`.
 
 # ─────────────────────────────────────────────
 # ANDROID LANES
@@ -26,6 +41,30 @@ platform :android do
     File.write(build_gradle_path, content)
 
     UI.success("Version set → #{version_name} (#{version_code})")
+  end
+
+  desc "Fetch max version code from Play internal track, +1, write to NEXT_VERSION_CODE_FILE (or next_version_code.txt)"
+  lane :fetch_next_version_code do
+    max_live = 0
+    begin
+      codes = google_play_track_version_codes(
+        track:        "internal",
+        json_key:     ENV["GOOGLE_PLAY_JSON_KEY_PATH"],
+        package_name: ENV["ANDROID_PACKAGE_NAME"],
+      )
+      max_live = (codes || []).max || 0
+      UI.message("Play internal track max version code: #{max_live}")
+    rescue => e
+      # Internal track empty/unconfigured, or app not yet on Play — start from 0
+      UI.important("Could not read internal track (#{e.class}: #{e.message}). Falling back to max_live=0.")
+    end
+
+    next_code = max_live + 1
+    UI.success("Next version code: #{next_code} (last on internal: #{max_live})")
+
+    out_file = ENV["NEXT_VERSION_CODE_FILE"] || File.expand_path("next_version_code.txt")
+    File.write(out_file, next_code.to_s)
+    UI.message("Wrote #{next_code} to #{out_file}")
   end
 
   desc "Abort if VERSION_CODE in .env is not higher than what's already on Play Store"
@@ -115,7 +154,11 @@ platform :android do
 end
 
 # ─────────────────────────────────────────────
-# iOS LANES
+# iOS LANES — automatic signing (self-hosted Mac runner)
+#
+# `ship_auto` is the entry point called by capacitor-selfhosted.yml. It builds
+# with `sigh`-fetched provisioning profile (via App Store Connect API key) and
+# the distribution cert from the host login keychain. No manual signing path.
 # ─────────────────────────────────────────────
 platform :ios do
 
@@ -140,20 +183,6 @@ platform :ios do
     UI.success("Version set → #{version_name} (#{version_code})")
   end
 
-  desc "Set manual signing on the App target only (not Pods/Firebase targets)"
-  private_lane :set_ios_signing do
-    xcodeproj = File.expand_path(File.join(ENV["CAPACITOR_PROJECT_PATH"], "ios/App/App.xcodeproj"))
-    update_code_signing_settings(
-      use_automatic_signing: false,
-      path:               xcodeproj,
-      targets:            ["App"],          # Only the App target — not Pods, Firebase, etc.
-      team_id:            ENV["APPLE_TEAM_ID"],
-      code_sign_identity: "Apple Distribution",
-      profile_name:       ENV["IOS_PROVISIONING_PROFILE_NAME"],
-      bundle_identifier:  ENV["IOS_BUNDLE_ID"],
-    )
-  end
-
   desc "Configure App Store Connect API auth"
   private_lane :setup_api_key do
     app_store_connect_api_key(
@@ -164,11 +193,53 @@ platform :ios do
     )
   end
 
-  desc "Build a signed iOS IPA (release)"
-  lane :build do
+  desc "Download AppLovin Quality Service (Ad Review) xcframework if missing"
+  private_lane :ensure_applovin_quality_service do
+    ios_dir = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App'))
+    setup_script = File.join(ios_dir, 'AppLovinQualityServiceSetup-ios.rb')
+    xcframework  = File.join(ios_dir, 'AppLovinQualityService', 'AppLovinQualityService.xcframework')
+
+    # Self-detecting: skip silently if project doesn't use AppLovin Quality Service.
+    next unless File.exist?(setup_script)
+    next if Dir.exist?(xcframework)
+
+    UI.message("AppLovinQualityService.xcframework not found — running setup script…")
+    Dir.chdir(ios_dir) do
+      sh("ruby", "AppLovinQualityServiceSetup-ios.rb")
+    end
+    UI.success("AppLovin Quality Service installed")
+  end
+
+  desc "Fetch/refresh Distribution profile via sigh, then patch App target to manual signing with it"
+  private_lane :set_ios_signing_sigh do
+    # sigh uses the API key (set up by setup_api_key above) to create or
+    # refresh an App Store distribution provisioning profile. The profile
+    # is downloaded and installed in ~/Library/MobileDevice/Provisioning Profiles.
+    # No .mobileprovision secret needed — Apple manages the profile, sigh fetches it.
+    get_provisioning_profile(
+      app_identifier: ENV["IOS_BUNDLE_ID"],
+      development:    false,    # We want a distribution profile, not development
+      force:          false,    # Reuse existing if still valid (renews only when needed)
+    )
+
+    xcodeproj = File.expand_path(File.join(ENV["CAPACITOR_PROJECT_PATH"], "ios/App/App.xcodeproj"))
+    update_code_signing_settings(
+      use_automatic_signing: false,                                # Must be manual — automatic always picks dev profile for archive
+      path:               xcodeproj,
+      targets:            ["App"],                                 # ONLY the App target — leaves Pods/SPM untouched
+      team_id:            ENV["APPLE_TEAM_ID"],
+      code_sign_identity: "Apple Distribution",
+      profile_name:       lane_context[SharedValues::SIGH_NAME],   # Profile name returned by sigh above
+      bundle_identifier:  ENV["IOS_BUNDLE_ID"],
+    )
+  end
+
+  desc "Build a signed iOS IPA on the self-hosted Mac runner — profile fetched via sigh, cert from host keychain"
+  private_lane :build_auto do
     set_ios_version
-    set_ios_signing          # Patches App target only — leaves Pods/Firebase targets untouched
-    setup_api_key
+    setup_api_key                  # App Store Connect API key — needed by sigh below + gym/pilot later
+    set_ios_signing_sigh           # Fetches Distribution profile, patches App target to manual signing
+    ensure_applovin_quality_service
     workspace = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App/App.xcworkspace'))
     project   = File.expand_path(File.join(ENV['CAPACITOR_PROJECT_PATH'], 'ios/App/App.xcodeproj'))
     gym(
@@ -178,16 +249,13 @@ platform :ios do
       configuration:    "Release",
       output_directory: "./build_output",
       clean:            true,
-      # No xcargs signing overrides — update_code_signing_settings already
-      # patched the xcodeproj so only the App target has manual signing set.
-      # Global xcargs would bleed into Firebase/Pods targets and cause errors.
       export_options: {
         method:               "app-store",
         signingStyle:         "manual",
         signingCertificate:   "Apple Distribution",
         teamID:               ENV["APPLE_TEAM_ID"],
         provisioningProfiles: {
-          ENV["IOS_BUNDLE_ID"] => ENV["IOS_PROVISIONING_PROFILE_NAME"],
+          ENV["IOS_BUNDLE_ID"] => lane_context[SharedValues::SIGH_NAME],
         },
       },
     )
@@ -207,9 +275,9 @@ platform :ios do
     )
   end
 
-  desc "Build + Upload to TestFlight in one shot"
-  lane :ship do
-    build
+  desc "Build + Upload to TestFlight using automatic signing (sigh + host keychain cert)"
+  lane :ship_auto do
+    build_auto
     upload
     notify_success("iOS")
   end

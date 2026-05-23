@@ -1,10 +1,10 @@
 name: Unity Build (Self-Hosted Mac)
 
 # ─────────────────────────────────────────────────────────────
-# REUSABLE WORKFLOW — runs Unity Android + iOS builds on a
-# self-hosted macOS runner (e.g. an office Mac mini).
+# REUSABLE WORKFLOW — runs Unity Android + iOS builds on the
+# self-hosted Mac mini.
 #
-# Differences vs unity.yml (the GitHub-hosted version):
+# Notes:
 #   - Calls Unity Editor natively (no Docker / game-ci action)
 #   - One iOS job (no Linux→macOS artifact handoff)
 #   - Unity Library cache persists in workspace between runs
