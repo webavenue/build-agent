@@ -334,9 +334,13 @@ jobs:
 
       # The shared Fastfile (build-agent/fastlane/capacitor/Fastfile, imported
       # by the caller via `import_from_git`) defines `fetch_next_version_code`,
-      # which queries Play's internal track and returns max+1. We auto-detect
-      # the lane and fall back to `version_code_offset + run_number` only if it's
-      # missing — protects callers that haven't migrated to the shared Fastfile yet.
+      # which queries Play's internal track and returns max+1. We attempt to
+      # run the lane directly — if it fails (lane missing, no Play creds, API
+      # error), we fall back to `version_code_offset + run_number`.
+      #
+      # Note: we don't pre-detect with `fastlane lanes`, because that command
+      # doesn't always surface lanes loaded via `import_from_git` — only an
+      # actual lane invocation triggers the remote clone reliably.
       - name: Compute version code
         id: version
         env:
@@ -345,20 +349,20 @@ jobs:
           NEXT_VERSION_CODE_FILE: ${{ github.workspace }}/next_version_code.txt
           CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
         run: |
-          set -e
           FALLBACK_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
 
-          if bundle exec fastlane lanes 2>/dev/null | grep -qE '^\s*android\s+fetch_next_version_code'; then
-            echo "✓ Caller Fastfile defines android.fetch_next_version_code — querying Play internal track"
-            if bundle exec fastlane android fetch_next_version_code && [ -s "$NEXT_VERSION_CODE_FILE" ]; then
-              CODE=$(cat "$NEXT_VERSION_CODE_FILE")
-              echo "✓ Play-derived version code: $CODE"
-            else
-              echo "⚠ fetch_next_version_code lane failed — falling back to offset+run_number ($FALLBACK_CODE)"
-              CODE="$FALLBACK_CODE"
-            fi
+          echo "→ Attempting to derive version code from Play internal track…"
+          set +e
+          bundle exec fastlane android fetch_next_version_code
+          LANE_EXIT=$?
+          set -e
+
+          if [ "$LANE_EXIT" -eq 0 ] && [ -s "$NEXT_VERSION_CODE_FILE" ]; then
+            CODE=$(cat "$NEXT_VERSION_CODE_FILE")
+            echo "✓ Play-derived version code: $CODE"
           else
-            echo "ℹ Caller Fastfile has no fetch_next_version_code lane — using offset+run_number ($FALLBACK_CODE)"
+            echo "⚠ fetch_next_version_code lane failed (exit=$LANE_EXIT) or wrote no output."
+            echo "  Falling back to offset+run_number: $FALLBACK_CODE"
             CODE="$FALLBACK_CODE"
           fi
 
