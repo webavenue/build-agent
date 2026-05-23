@@ -410,6 +410,48 @@ jobs:
             bundle exec fastlane android build_apk
           fi
 
+      # Diagnostic: report whether the AAB actually contains the
+      # `BUNDLE-METADATA/com.android.tools.build.debugsymbols/` folder.
+      # If you see "missing native debug symbols" in Play Console despite
+      # `debugSymbolLevel 'FULL'` being set in build.gradle, this step
+      # will tell you whether the symbols are being bundled at build time
+      # (build problem — likely NDK or vendor-stripped .so files) or
+      # whether they're being uploaded but flagged anyway (Play Console
+      # lag on older bundles).
+      - name: Verify native debug symbols in AAB
+        if: inputs.action == 'build + upload'
+        run: |
+          AAB="android/app/build/outputs/bundle/release/app-release.aab"
+          if [ ! -f "$AAB" ]; then
+            echo "ℹ AAB not found at $AAB — skipping verification (build_apk path)."
+            exit 0
+          fi
+          echo "── AAB: $AAB ──"
+          ls -lh "$AAB"
+          echo
+          echo "── Native libs (.so) in AAB ──"
+          unzip -l "$AAB" | grep '\.so$' | head -20 || echo "(none)"
+          echo
+          echo "── Debug-symbol metadata in AAB ──"
+          DBG_LINES=$(unzip -l "$AAB" | grep 'BUNDLE-METADATA/com.android.tools.build.debugsymbols' || true)
+          if [ -z "$DBG_LINES" ]; then
+            echo "✗ No 'BUNDLE-METADATA/com.android.tools.build.debugsymbols/' folder found in AAB."
+            echo "  → Play Console will warn 'missing native debug symbols' for this build."
+            echo "  → Likely causes:"
+            echo "    1. NDK not installed on the runner (AGP can't extract symbols)."
+            echo "    2. All .so files came pre-stripped from third-party AARs (nothing to extract)."
+          else
+            echo "$DBG_LINES" | head -20
+            COUNT=$(echo "$DBG_LINES" | wc -l | tr -d ' ')
+            TOTAL_BYTES=$(echo "$DBG_LINES" | awk '{sum+=$1} END {print sum+0}')
+            echo
+            echo "✓ Found $COUNT debug-symbol entries totalling $TOTAL_BYTES bytes."
+            if [ "$TOTAL_BYTES" -lt 1024 ]; then
+              echo "⚠ Symbols folder is suspiciously small — likely empty placeholders."
+              echo "  Play Console may still warn. Check whether vendor AARs ship unstripped .so files."
+            fi
+          fi
+
       - name: Upload APK artifact
         if: inputs.action == 'build only'
         uses: actions/upload-artifact@v4
