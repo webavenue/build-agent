@@ -426,31 +426,78 @@ jobs:
             echo "ℹ AAB not found at $AAB — skipping verification (build_apk path)."
             exit 0
           fi
+
           echo "── AAB: $AAB ──"
           ls -lh "$AAB"
           echo
-          echo "── Native libs (.so) in AAB ──"
-          unzip -l "$AAB" | grep '\.so$' | head -20 || echo "(none)"
-          echo
-          echo "── Debug-symbol metadata in AAB ──"
+
+          echo "── Debug-symbol metadata in AAB (BUNDLE-METADATA/...debugsymbols/) ──"
           DBG_LINES=$(unzip -l "$AAB" | grep 'BUNDLE-METADATA/com.android.tools.build.debugsymbols' || true)
-          if [ -z "$DBG_LINES" ]; then
-            echo "✗ No 'BUNDLE-METADATA/com.android.tools.build.debugsymbols/' folder found in AAB."
-            echo "  → Play Console will warn 'missing native debug symbols' for this build."
-            echo "  → Likely causes:"
-            echo "    1. NDK not installed on the runner (AGP can't extract symbols)."
-            echo "    2. All .so files came pre-stripped from third-party AARs (nothing to extract)."
-          else
+          if [ -n "$DBG_LINES" ]; then
             echo "$DBG_LINES" | head -20
             COUNT=$(echo "$DBG_LINES" | wc -l | tr -d ' ')
             TOTAL_BYTES=$(echo "$DBG_LINES" | awk '{sum+=$1} END {print sum+0}')
             echo
             echo "✓ Found $COUNT debug-symbol entries totalling $TOTAL_BYTES bytes."
-            if [ "$TOTAL_BYTES" -lt 1024 ]; then
-              echo "⚠ Symbols folder is suspiciously small — likely empty placeholders."
-              echo "  Play Console may still warn. Check whether vendor AARs ship unstripped .so files."
-            fi
+            [ "$TOTAL_BYTES" -lt 1024 ] && echo "⚠ Suspiciously small — Play Console may still warn."
+            exit 0
           fi
+
+          echo "✗ No debugsymbols folder in AAB. Investigating why…"
+          echo
+
+          echo "── AGP intermediate: native_debug_metadata ──"
+          for D in android/app/build/intermediates/native_debug_metadata/release \
+                   android/app/build/intermediates/merged_native_libs/release; do
+            if [ -d "$D" ]; then
+              echo "  Found: $D"
+              find "$D" -type f 2>/dev/null | head -30 | sed 's/^/    /'
+              FILES=$(find "$D" -type f 2>/dev/null | wc -l | tr -d ' ')
+              SIZED=$(find "$D" -type f -size +0 2>/dev/null | wc -l | tr -d ' ')
+              echo "  → $FILES files, $SIZED non-empty"
+            else
+              echo "  Missing: $D"
+            fi
+          done
+          echo
+
+          echo "── Strip status of vendor .so files (before AGP packages them) ──"
+          # Find merged native libs (state AGP sees them in) and report their type.
+          # 'not stripped' means debug info is present → AGP CAN extract symbols.
+          # 'stripped'     means vendor shipped without debug info → nothing to extract.
+          MERGED_SO_DIR=$(find android/app/build/intermediates/merged_native_libs -type d -name arm64-v8a 2>/dev/null | head -1)
+          if [ -n "$MERGED_SO_DIR" ]; then
+            echo "  $MERGED_SO_DIR/"
+            for SO in "$MERGED_SO_DIR"/*.so; do
+              [ -e "$SO" ] || continue
+              FILE_INFO=$(file -b "$SO")
+              # ELF files report "stripped" or "not stripped" at the end
+              if echo "$FILE_INFO" | grep -q "not stripped"; then
+                STATUS="✓ has debug info"
+              else
+                STATUS="✗ stripped (no symbols to extract)"
+              fi
+              printf "    %-50s  %s\n" "$(basename "$SO")" "$STATUS"
+            done | head -30
+          else
+            echo "  Merged native libs dir not found — can't check strip status."
+          fi
+          echo
+
+          echo "── NDK setup ──"
+          echo "  ANDROID_HOME: ${ANDROID_HOME:-(unset)}"
+          if [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/ndk" ]; then
+            ls "$ANDROID_HOME/ndk/" | sed 's/^/    NDK: /'
+          else
+            echo "    No NDK directory found under ANDROID_HOME"
+          fi
+          echo
+          echo "Interpretation: if all .so files above show ✗ stripped, the vendor SDKs"
+          echo "(AppLovin, Pangle, ApMinsight, etc.) shipped pre-stripped binaries and"
+          echo "there's nothing AGP can extract. The Play Console warning is unactionable"
+          echo "in that case — use Firebase Crashlytics NDK for native crash reporting on"
+          echo "code you own, and accept that vendor-internal native crashes can only be"
+          echo "deobfuscated by the vendor."
 
       - name: Upload APK artifact
         if: inputs.action == 'build only'
