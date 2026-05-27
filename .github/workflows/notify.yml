@@ -90,6 +90,11 @@ on:
         type: string
         required: false
         default: 'main'
+      model:
+        description: 'Anthropic model id used to draft the changelog. Defaults to Haiku 4.5 (cheapest).'
+        type: string
+        required: false
+        default: 'claude-haiku-4-5'
 
 jobs:
   notify:
@@ -145,6 +150,7 @@ jobs:
         id: changelog
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ inputs.model }}
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PROJECT_NAME: ${{ inputs.project_name }}

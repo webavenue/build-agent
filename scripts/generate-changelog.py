@@ -45,7 +45,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-haiku-4-5"
+# Caller picks the model via ANTHROPIC_MODEL env. Falls back to Haiku 4.5,
+# the cheapest current option — fine for most changelog runs. Use Sonnet
+# when commit volume is high or PR bodies are sparse; Opus for the rare
+# release where you want the most polished QA notes.
+DEFAULT_MODEL = "claude-haiku-4-5"
 ANTHROPIC_MAX_TOKENS = 4096
 
 # Truncation caps to keep the prompt bounded regardless of PR size.
@@ -335,10 +339,10 @@ def build_prompt(
     return "\n".join(parts)
 
 
-def call_claude(api_key: str, prompt: str) -> dict[str, Any]:
+def call_claude(api_key: str, prompt: str, model: str) -> dict[str, Any]:
     """Single Claude API call. Returns parsed JSON object. Raises on failure."""
     payload = {
-        "model": ANTHROPIC_MODEL,
+        "model": model,
         "max_tokens": ANTHROPIC_MAX_TOKENS,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -506,6 +510,7 @@ def main() -> int:
         return 1
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    model = os.environ.get("ANTHROPIC_MODEL", "").strip() or DEFAULT_MODEL
     fallback_notes = os.environ.get("FALLBACK_RELEASE_NOTES", "").strip()
     project_name = os.environ.get("PROJECT_NAME", "this project").strip()
     extra_hint = os.environ.get("EXTRA_QA_HINT", "").strip()
@@ -570,6 +575,7 @@ def main() -> int:
     )
     prompt = build_prompt(config, prs, direct)
     sys.stderr.write(f"Prompt size: {len(prompt)} chars\n")
+    sys.stderr.write(f"Model: {model}\n")
 
     if not api_key:
         sys.stderr.write("ERROR: ANTHROPIC_API_KEY env required for generation\n")
@@ -580,7 +586,7 @@ def main() -> int:
         )
 
     try:
-        payload = call_claude(api_key, prompt)
+        payload = call_claude(api_key, prompt, model)
     except Exception as e:
         sys.stderr.write(f"ERROR: Claude call failed: {e}\n")
         return _emit_fallback_or_fail(
