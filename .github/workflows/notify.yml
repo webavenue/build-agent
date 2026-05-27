@@ -1,0 +1,420 @@
+name: Notify (changelog + Asana + Slack + tag)
+
+# ─────────────────────────────────────────────────────────────
+# REUSABLE WORKFLOW — auto-generates a QA changelog from commits
+# since the last build/* tag, creates Asana QA tasks (one per
+# platform that was built), posts a Slack message, and pushes a
+# new build/<X.Y.Z> tag anchored on the Android version.
+#
+# Designed to be called by two upstream flows:
+#   • unity-selfhosted.yml — projects we build ourselves
+#   • external-notify.yml  — projects built by an external studio
+#                            (fetches versions from Play / TestFlight first)
+#
+# Either platform's inputs may be omitted ("") to indicate that
+# platform was not built for this run; the matching Asana task
+# is skipped and the Slack message adapts.
+#
+# Caller MUST grant `contents: write` so the tag push succeeds.
+# ─────────────────────────────────────────────────────────────
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'Source branch — used as the changelog range end and the SHA the build/* tag points at.'
+        type: string
+        required: true
+      project_name:
+        description: 'Display name passed into the LLM prompt (e.g. "Colorwood Associations").'
+        type: string
+        required: true
+      app_name:
+        description: 'Short name used in the Slack message header.'
+        type: string
+        required: true
+      android_version_full:
+        description: 'Full Android version e.g. "1.22.19791". Empty string skips Android.'
+        type: string
+        required: false
+        default: ''
+      android_version_code:
+        description: 'Android versionCode e.g. "19791". Empty skips.'
+        type: string
+        required: false
+        default: ''
+      ios_version_full:
+        description: 'Full iOS version e.g. "1.22.19791". Empty string skips iOS.'
+        type: string
+        required: false
+        default: ''
+      ios_version_code:
+        description: 'iOS build number e.g. "19791". Empty skips.'
+        type: string
+        required: false
+        default: ''
+      release_notes_override:
+        description: 'Used only when the LLM yields no notes (empty commit range or LLM error).'
+        type: string
+        required: false
+        default: ''
+      do_asana:
+        type: boolean
+        required: false
+        default: true
+      do_slack:
+        type: boolean
+        required: false
+        default: true
+      android_download_url:
+        description: 'Optional Slack-only direct download link for Android.'
+        type: string
+        required: false
+        default: ''
+      high_risk_paths:
+        description: 'Newline-separated repo path substrings to auto-mark risk=high.'
+        type: string
+        required: false
+        default: ''
+      ignore_paths:
+        description: 'Newline-separated repo paths to filter out of PR file lists before prompting.'
+        type: string
+        required: false
+        default: ''
+      extra_qa_hint:
+        description: 'Free-form note appended to the LLM prompt.'
+        type: string
+        required: false
+        default: ''
+      build_agent_ref:
+        description: 'Ref of the build-agent repo to pull scripts from. Pin to a tag for stability.'
+        type: string
+        required: false
+        default: 'main'
+
+jobs:
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # tag push
+      pull-requests: read   # gh pr view
+
+    steps:
+
+      # ───────────────────────────────────────────────────────
+      # CHECKOUT — caller repo with full history + tags. We
+      # need the full log to compute the build/* range and we
+      # need tag visibility to read AND push the next tag.
+      # ───────────────────────────────────────────────────────
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      # The changelog generator lives in build-agent. Pull it
+      # into a sibling dir so we don't pollute the caller repo.
+      - name: Checkout build-agent scripts
+        uses: actions/checkout@v4
+        with:
+          repository: webavenue/build-agent
+          ref: ${{ inputs.build_agent_ref }}
+          path: .build-agent
+
+      # ───────────────────────────────────────────────────────
+      # RANGE — previous build/* tag → HEAD.
+      # ───────────────────────────────────────────────────────
+      - name: Resolve commit range
+        id: range
+        run: |
+          PREV=$(git describe --tags --match 'build/*' --abbrev=0 HEAD 2>/dev/null || echo "")
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "from=$PREV"        >> "$GITHUB_OUTPUT"
+          echo "to=HEAD"            >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Previous build tag: ${PREV:-<none>}"
+          echo "HEAD SHA:           $HEAD_SHA"
+
+      # ───────────────────────────────────────────────────────
+      # CHANGELOG — Claude Haiku 4.5 via stdlib HTTP. Outputs
+      # a markdown blob (for Asana) and a compact short blob
+      # (for Play Store / Slack tail).
+      # ───────────────────────────────────────────────────────
+      - name: Generate changelog
+        id: changelog
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          FALLBACK_RELEASE_NOTES: ${{ inputs.release_notes_override }}
+          COMMIT_RANGE_FROM: ${{ steps.range.outputs.from }}
+          COMMIT_RANGE_TO: ${{ steps.range.outputs.to }}
+          HIGH_RISK_PATHS: ${{ inputs.high_risk_paths }}
+          IGNORE_PATHS: ${{ inputs.ignore_paths }}
+          EXTRA_QA_HINT: ${{ inputs.extra_qa_hint }}
+        run: |
+          python3 .build-agent/scripts/generate-changelog.py
+
+      # Slack's mrkdwn uses *single-asterisk* for bold and has no
+      # heading syntax. Mechanical translation of the markdown
+      # output is good enough — bullets and bold come through.
+      - name: Render Slack-flavored notes
+        id: slack_render
+        env:
+          MD: ${{ steps.changelog.outputs.release_notes_md }}
+        run: |
+          SLACK=$(printf '%s' "$MD" \
+            | sed -E 's/^### (.*)$/*\1*/' \
+            | sed -E 's/\*\*([^*]+)\*\*/*\1*/g')
+          {
+            echo 'slack<<SLACK_EOF'
+            echo "$SLACK"
+            echo 'SLACK_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # ───────────────────────────────────────────────────────
+      # ASANA — one task per platform, identical body, each with
+      # its own version (option b). Matches the title scheme used
+      # by unity-selfhosted.yml for consistency.
+      # ───────────────────────────────────────────────────────
+      - name: Create Android Asana QA task
+        id: asana_android
+        if: inputs.do_asana && inputs.android_version_full != ''
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_FULL: ${{ inputs.android_version_full }}
+          VERSION_CODE: ${{ inputs.android_version_code }}
+          BRANCH: ${{ inputs.branch }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
+        run: |
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [Android] ${VERSION_CODE}(${VERSION_FULL}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          if [ -n "$ASANA_PROJECT_ID" ]; then
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
+          else
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
+          fi
+
+          # Build the multi-line notes body separately, then hand it to jq as a
+          # single value so we don't break YAML block-scalar indentation.
+          NOTES=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+          PAYLOAD=$(jq -n \
+            --arg name "$TASK_NAME" \
+            --arg notes "$NOTES" \
+            --argjson projects "$PROJECTS" \
+            --arg assignee "$ASANA_ASSIGNEE_ID" \
+            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee}}')
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
+          if [ -z "$TASK_GID" ]; then
+            echo "::warning::Failed to create Android Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> "$GITHUB_OUTPUT"
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ Android Asana task: $TASK_URL"
+            echo "task_url=$TASK_URL" >> "$GITHUB_OUTPUT"
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      - name: Create iOS Asana QA task
+        id: asana_ios
+        if: inputs.do_asana && inputs.ios_version_full != ''
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_FULL: ${{ inputs.ios_version_full }}
+          VERSION_CODE: ${{ inputs.ios_version_code }}
+          BRANCH: ${{ inputs.branch }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
+        run: |
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [iOS] ${VERSION_CODE}(${VERSION_FULL}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          if [ -n "$ASANA_PROJECT_ID" ]; then
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
+          else
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
+          fi
+
+          NOTES=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+          PAYLOAD=$(jq -n \
+            --arg name "$TASK_NAME" \
+            --arg notes "$NOTES" \
+            --argjson projects "$PROJECTS" \
+            --arg assignee "$ASANA_ASSIGNEE_ID" \
+            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee}}')
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          TASK_GID=$(echo "$TASK_RESPONSE" | jq -r '.data.gid // empty')
+          if [ -z "$TASK_GID" ]; then
+            echo "::warning::Failed to create iOS Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> "$GITHUB_OUTPUT"
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ iOS Asana task: $TASK_URL"
+            echo "task_url=$TASK_URL" >> "$GITHUB_OUTPUT"
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      # ───────────────────────────────────────────────────────
+      # SLACK — single channel message in the existing build-agent
+      # format, with the full changelog inline.
+      # ───────────────────────────────────────────────────────
+      - name: Slack notification
+        if: inputs.do_slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          APP_NAME: ${{ inputs.app_name }}
+          ANDROID_VERSION_FULL: ${{ inputs.android_version_full }}
+          ANDROID_VERSION_CODE: ${{ inputs.android_version_code }}
+          IOS_VERSION_FULL: ${{ inputs.ios_version_full }}
+          IOS_VERSION_CODE: ${{ inputs.ios_version_code }}
+          BRANCH: ${{ inputs.branch }}
+          ANDROID_DOWNLOAD_URL: ${{ inputs.android_download_url }}
+          RELEASE_NOTES: ${{ steps.slack_render.outputs.slack }}
+          ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
+          IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
+        run: |
+          # ── Platforms label + version line ───────────────────
+          PLATFORMS=""
+          [ -n "$ANDROID_VERSION_FULL" ] && PLATFORMS="Android"
+          if [ -n "$IOS_VERSION_FULL" ]; then
+            if [ -n "$PLATFORMS" ]; then PLATFORMS="${PLATFORMS} + iOS"; else PLATFORMS="iOS"; fi
+          fi
+
+          if [ -n "$ANDROID_VERSION_FULL" ] && [ -n "$IOS_VERSION_FULL" ]; then
+            if [ "$ANDROID_VERSION_FULL" = "$IOS_VERSION_FULL" ]; then
+              VERSION_LINE="Version: ${ANDROID_VERSION_FULL}"
+            else
+              VERSION_LINE="Version: Android ${ANDROID_VERSION_FULL} · iOS ${IOS_VERSION_FULL}"
+            fi
+          elif [ -n "$ANDROID_VERSION_FULL" ]; then
+            VERSION_LINE="Version: ${ANDROID_VERSION_FULL} (${ANDROID_VERSION_CODE})"
+          else
+            VERSION_LINE="Version: ${IOS_VERSION_FULL} (${IOS_VERSION_CODE})"
+          fi
+
+          # ── Assemble the message body (matches build-agent format) ──
+          # Built via printf so multi-line content doesn't break YAML
+          # block-scalar indentation (Slack-style emoji colons at column 0
+          # would otherwise be parsed as top-level YAML keys).
+          MESSAGE=$(printf 'Hello <!channel>\n:white_check_mark: *%s — %s*\n\n:package: %s\n:herb: Branch: %s\n:memo: Release Details\n%s' \
+            "$APP_NAME" "$PLATFORMS" "$VERSION_LINE" "$BRANCH" "$RELEASE_NOTES")
+
+          if [ -n "$ANDROID_VERSION_FULL" ]; then
+            ANDROID_LINE=$(printf '\n:robot_face: Android → Play Store internal track')
+            if [ -n "$ANDROID_DOWNLOAD_URL" ]; then
+              ANDROID_LINE="${ANDROID_LINE} | <${ANDROID_DOWNLOAD_URL}|Download>"
+            fi
+            MESSAGE="${MESSAGE}${ANDROID_LINE}"
+          fi
+          if [ -n "$IOS_VERSION_FULL" ]; then
+            MESSAGE="${MESSAGE}$(printf '\n:apple: iOS → TestFlight')"
+          fi
+          if [ -n "$ANDROID_TASK_URL" ]; then
+            MESSAGE="${MESSAGE}$(printf '\n:pushpin: Android QA: <%s|View task>' "$ANDROID_TASK_URL")"
+          fi
+          if [ -n "$IOS_TASK_URL" ]; then
+            MESSAGE="${MESSAGE}$(printf '\n:pushpin: iOS QA: <%s|View task>' "$IOS_TASK_URL")"
+          fi
+
+          # jq builds the JSON so embedded newlines are escaped correctly.
+          PAYLOAD=$(jq -n \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg text "$MESSAGE" \
+            '{channel: $channel, text: $text}')
+
+          RESP=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          OK=$(echo "$RESP" | jq -r '.ok')
+          if [ "$OK" != "true" ]; then
+            echo "::warning::Slack post failed: $RESP"
+          else
+            echo "✓ Slack notification sent"
+          fi
+
+      # ───────────────────────────────────────────────────────
+      # TAG — push build/<X.Y.Z> on success. Anchored on Android
+      # version per the design; falls back to iOS only when
+      # Android wasn't built this run. Idempotent: skips if tag
+      # already points at HEAD; errors if it points elsewhere.
+      # ───────────────────────────────────────────────────────
+      - name: Push build tag
+        if: inputs.android_version_full != '' || inputs.ios_version_full != ''
+        env:
+          ANDROID_VERSION_FULL: ${{ inputs.android_version_full }}
+          IOS_VERSION_FULL: ${{ inputs.ios_version_full }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
+          HEAD_SHA: ${{ steps.range.outputs.head_sha }}
+        run: |
+          if [ -n "$ANDROID_VERSION_FULL" ]; then
+            TAG_VERSION="$ANDROID_VERSION_FULL"
+          else
+            TAG_VERSION="$IOS_VERSION_FULL"
+          fi
+          TAG="build/$TAG_VERSION"
+
+          # Idempotency: re-runs against the same SHA should be a no-op,
+          # but a collision at a different SHA is a real configuration
+          # error and must fail loudly.
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            EXISTING=$(git rev-list -n1 "$TAG")
+            if [ "$EXISTING" = "$HEAD_SHA" ]; then
+              echo "Tag $TAG already exists at HEAD — skipping"
+              exit 0
+            fi
+            echo "::error::Tag $TAG already exists at $EXISTING (HEAD is $HEAD_SHA). Refusing to overwrite."
+            exit 1
+          fi
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+
+          # Annotated tag with the changelog as the message — handy for `git tag -n`.
+          MSG_FILE=$(mktemp)
+          printf 'Build %s\n\n%s\n' "$TAG_VERSION" "$RELEASE_NOTES" > "$MSG_FILE"
+          git tag -a "$TAG" -F "$MSG_FILE" "$HEAD_SHA"
+          git push origin "$TAG"
+          echo "✓ Pushed tag $TAG → $HEAD_SHA"
