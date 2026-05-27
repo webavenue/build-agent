@@ -457,6 +457,192 @@ def render_short(payload: dict[str, Any], char_cap: int = 480) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SDK Changes — deterministic diff of Packages/manifest.json + packages-lock.json
+# between the previous build tag and HEAD. Appended after the LLM-generated
+# QA Focus section so QA can see exactly which third-party packages moved.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_MANIFEST_PATH = "Packages/manifest.json"
+DEFAULT_LOCKFILE_PATH = "Packages/packages-lock.json"
+
+
+@dataclass
+class PkgSnapshot:
+    """One package's identity at a point in time.
+
+    `ref` is the human-friendly version label (semver tag, git fragment, or
+    None when the package is git-tracked with no explicit ref).
+    `hash` is the resolved git SHA from packages-lock.json (None for registry
+    packages, which don't have one).
+    """
+
+    ref: str | None
+    hash: str | None
+
+    @property
+    def display(self) -> str:
+        if self.ref:
+            return self.ref
+        if self.hash:
+            return self.hash[:7]
+        return "?"
+
+
+def git_show(ref: str, path: str) -> str | None:
+    """Read the file at a git ref. Returns None when the path or ref is absent."""
+    res = subprocess.run(
+        ["git", "show", f"{ref}:{path}"],
+        capture_output=True,
+        text=True,
+    )
+    return res.stdout if res.returncode == 0 else None
+
+
+def _looks_like_url(s: str) -> bool:
+    """Truthy for any git/file/registry URL we might encounter in manifests.
+
+    SSH URLs (`git@github.com:foo/bar.git`) lack `://`, so we explicitly check
+    for the other common prefixes too.
+    """
+    return (
+        "://" in s
+        or s.startswith("git@")
+        or s.startswith("git+")
+        or s.startswith("file:")
+    )
+
+
+def _parse_dependencies(content: str | None) -> dict[str, Any]:
+    """Pull out the `dependencies` map from a manifest or lockfile blob."""
+    if not content:
+        return {}
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    deps = data.get("dependencies", {})
+    return deps if isinstance(deps, dict) else {}
+
+
+def snapshot_package(
+    pkg_id: str, manifest: dict[str, Any], lockfile: dict[str, Any]
+) -> PkgSnapshot | None:
+    """Build a (ref, hash) snapshot from manifest + lockfile entries.
+
+    Resolution priority for `ref`:
+      1. Git URL fragment from manifest (e.g. `...#1.4.0` → "1.4.0").
+      2. Plain version string in manifest (registry packages, e.g. "4.4.2").
+      3. Registry version from lockfile (when manifest didn't have it directly).
+    `hash` comes from packages-lock.json — only present for git-sourced packages.
+    """
+    in_m = pkg_id in manifest
+    in_l = pkg_id in lockfile
+    if not in_m and not in_l:
+        return None
+
+    ref: str | None = None
+    m_val = manifest.get(pkg_id)
+    if isinstance(m_val, str):
+        if _looks_like_url(m_val):
+            # URL — use the `#fragment` as ref if present, else leave ref None
+            # so we fall back to the lockfile hash (branch-tracked package).
+            if "#" in m_val:
+                fragment = m_val.split("#", 1)[1].split("?", 1)[0].strip()
+                ref = fragment or None
+        else:
+            ref = m_val  # plain version string (registry package)
+
+    l_entry = lockfile.get(pkg_id)
+    l_entry = l_entry if isinstance(l_entry, dict) else {}
+
+    # If we didn't get a ref from the manifest, try the lockfile version —
+    # but only if it's NOT itself a URL. Registry packages store their semver
+    # here as a plain string; git packages store the URL we already handled
+    # above (or a duplicate of it), so we ignore those to avoid showing the
+    # full git URL as a "version".
+    if ref is None:
+        l_version = l_entry.get("version")
+        if isinstance(l_version, str) and not _looks_like_url(l_version):
+            ref = l_version
+
+    h = l_entry.get("hash") if isinstance(l_entry.get("hash"), str) else None
+
+    return PkgSnapshot(ref=ref, hash=h)
+
+
+def diff_package(
+    old: PkgSnapshot | None, new: PkgSnapshot | None
+) -> str | None:
+    """Return a markdown-formatted change description, or None for no change.
+
+    Detects three flavours of change:
+      • added / removed
+      • display label changed (e.g. "1.4.0" → "1.5.0")
+      • display label identical but resolved SHA moved — happens for git
+        packages pinned to a branch like `#main`. Surfaced so QA isn't blind
+        to silent version drift.
+    """
+    if old is None and new is None:
+        return None
+    if old is None:
+        assert new is not None
+        return f"added at `{new.display}`"
+    if new is None:
+        return f"removed (was `{old.display}`)"
+
+    if old.display != new.display:
+        return f"`{old.display}` → `{new.display}`"
+
+    # Same display label — but did the underlying SHA move? (Branch-tracked deps.)
+    if old.hash and new.hash and old.hash != new.hash:
+        return (
+            f"`{old.display}` (SHA `{old.hash[:7]}` → `{new.hash[:7]}`)"
+        )
+
+    return None
+
+
+def compute_sdk_section(from_ref: str, to_ref: str) -> str:
+    """Return the rendered '### SDK Changes' markdown block, or '' if no changes."""
+    manifest_path = os.environ.get("SDK_MANIFEST_PATH", DEFAULT_MANIFEST_PATH)
+    lockfile_path = os.environ.get("SDK_LOCKFILE_PATH", DEFAULT_LOCKFILE_PATH)
+
+    old_m = _parse_dependencies(git_show(from_ref, manifest_path))
+    new_m = _parse_dependencies(git_show(to_ref, manifest_path))
+    old_l = _parse_dependencies(git_show(from_ref, lockfile_path))
+    new_l = _parse_dependencies(git_show(to_ref, lockfile_path))
+
+    if not (old_m or new_m or old_l or new_l):
+        # No manifest/lockfile at either ref — skip the section silently.
+        return ""
+
+    all_pkgs = set(old_m) | set(new_m) | set(old_l) | set(new_l)
+
+    lines: list[str] = []
+    for pkg_id in sorted(all_pkgs):
+        old_snap = snapshot_package(pkg_id, old_m, old_l)
+        new_snap = snapshot_package(pkg_id, new_m, new_l)
+        change = diff_package(old_snap, new_snap)
+        if change:
+            lines.append(f"- **{pkg_id}**: {change}")
+
+    if not lines:
+        return ""
+    return "### SDK Changes\n" + "\n".join(lines)
+
+
+def append_section(md: str, section: str) -> str:
+    """Append a markdown section to existing notes, joining with a blank line."""
+    if not section:
+        return md
+    if not md:
+        return section
+    return f"{md}\n\n{section}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Outputs
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -491,11 +677,16 @@ def env_lines(name: str, default: list[str] | None = None) -> list[str]:
     return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
-def fallback_output(notes: str, range_empty: bool, reason: str) -> None:
+def fallback_output(
+    notes: str, range_empty: bool, reason: str, sdk_section: str = ""
+) -> None:
     sys.stderr.write(f"Using fallback release notes: {reason}\n")
     fallback = notes.strip() or "Bug fixes and performance improvements."
+    # SDK section is deterministic and useful even when the LLM didn't run —
+    # append it so QA still sees package movement.
+    fallback_md = append_section(fallback, sdk_section)
     write_outputs(
-        release_notes_md=fallback,
+        release_notes_md=fallback_md,
         release_notes_short=fallback[:480],
         range_empty="true" if range_empty else "false",
         used_fallback="true",
@@ -521,6 +712,16 @@ def main() -> int:
         os.environ.get("COMMIT_RANGE_TO", ""),
     )
     sys.stderr.write(f"Commit range: {from_ref}..{to_ref}\n")
+
+    # SDK changes are deterministic from the manifest/lockfile diff — compute
+    # once here and append in every output path (LLM success, LLM failure,
+    # missing key, empty range). The function returns '' when there's nothing
+    # to show, so no special-casing needed downstream.
+    sdk_section = compute_sdk_section(from_ref, to_ref)
+    if sdk_section:
+        sys.stderr.write(
+            f"SDK changes detected: {sdk_section.count(chr(10)) - 1} package(s)\n"
+        )
 
     # ── Enumerate PRs and direct commits in the range ───────────────────────
     merge_subjects = merge_commits_in_range(from_ref, to_ref)
@@ -550,6 +751,7 @@ def main() -> int:
             fallback_notes,
             range_empty=True,
             reason="no commits or PRs in range",
+            sdk_section=sdk_section,
         )
 
     # ── Fetch PR metadata ──────────────────────────────────────────────────
@@ -582,6 +784,7 @@ def main() -> int:
             fallback_notes,
             range_empty=False,
             reason="missing ANTHROPIC_API_KEY",
+            sdk_section=sdk_section,
         )
 
     try:
@@ -592,9 +795,10 @@ def main() -> int:
             fallback_notes,
             range_empty=False,
             reason=f"LLM failure: {e}",
+            sdk_section=sdk_section,
         )
 
-    md = render_markdown(payload)
+    md = append_section(render_markdown(payload), sdk_section)
     short = render_short(payload)
 
     write_outputs(
@@ -607,9 +811,11 @@ def main() -> int:
     return 0
 
 
-def _emit_fallback_or_fail(notes: str, range_empty: bool, reason: str) -> int:
+def _emit_fallback_or_fail(
+    notes: str, range_empty: bool, reason: str, sdk_section: str = ""
+) -> int:
     if notes:
-        fallback_output(notes, range_empty, reason)
+        fallback_output(notes, range_empty, reason, sdk_section)
         return 0
     sys.stderr.write(
         f"ERROR: {reason} and no FALLBACK_RELEASE_NOTES provided — failing.\n"
