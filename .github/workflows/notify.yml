@@ -128,18 +128,53 @@ jobs:
           path: .build-agent
 
       # ───────────────────────────────────────────────────────
-      # RANGE — previous build/* tag → HEAD.
+      # RANGE — platform-aware. Each platform has its own tag
+      # progression (build/android/* and build/ios/*) so when
+      # iOS ships after Android for the same code, iOS QA sees
+      # the same changelog content (range = last build/ios/* →
+      # HEAD, not last *any* tag → HEAD, which would be empty).
+      #
+      # For a "both" run, we anchor on whichever of the two
+      # platform histories most recently tagged — that's the
+      # broadest valid range covering everything new since
+      # either platform last shipped.
       # ───────────────────────────────────────────────────────
       - name: Resolve commit range
         id: range
+        env:
+          ANDROID_VERSION_FULL: ${{ inputs.android_version_full }}
+          IOS_VERSION_FULL: ${{ inputs.ios_version_full }}
         run: |
-          PREV=$(git describe --tags --match 'build/*' --abbrev=0 HEAD 2>/dev/null || echo "")
+          ANDROID_PREV=$(git describe --tags --match 'build/android/*' --abbrev=0 HEAD 2>/dev/null || echo "")
+          IOS_PREV=$(git describe --tags --match 'build/ios/*' --abbrev=0 HEAD 2>/dev/null || echo "")
           HEAD_SHA=$(git rev-parse HEAD)
-          echo "from=$PREV"        >> "$GITHUB_OUTPUT"
-          echo "to=HEAD"            >> "$GITHUB_OUTPUT"
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "Previous build tag: ${PREV:-<none>}"
-          echo "HEAD SHA:           $HEAD_SHA"
+
+          if [ -n "$ANDROID_VERSION_FULL" ] && [ -n "$IOS_VERSION_FULL" ]; then
+            # Both platforms — pick whichever previous tag's commit is more recent.
+            if [ -n "$ANDROID_PREV" ] && [ -n "$IOS_PREV" ]; then
+              A_TS=$(git log -1 --format=%ct "$ANDROID_PREV")
+              I_TS=$(git log -1 --format=%ct "$IOS_PREV")
+              if [ "$A_TS" -ge "$I_TS" ]; then
+                PREV="$ANDROID_PREV"
+              else
+                PREV="$IOS_PREV"
+              fi
+            else
+              PREV="${ANDROID_PREV:-$IOS_PREV}"
+            fi
+          elif [ -n "$ANDROID_VERSION_FULL" ]; then
+            PREV="$ANDROID_PREV"
+          else
+            PREV="$IOS_PREV"
+          fi
+
+          echo "from=$PREV"         >> "$GITHUB_OUTPUT"
+          echo "to=HEAD"             >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA"  >> "$GITHUB_OUTPUT"
+          echo "Android prev tag: ${ANDROID_PREV:-<none>}"
+          echo "iOS prev tag:     ${IOS_PREV:-<none>}"
+          echo "Chosen anchor:    ${PREV:-<none>}"
+          echo "HEAD SHA:         $HEAD_SHA"
 
       # ───────────────────────────────────────────────────────
       # CHANGELOG — Claude Haiku 4.5 via stdlib HTTP. Outputs
@@ -382,29 +417,30 @@ jobs:
           fi
 
       # ───────────────────────────────────────────────────────
-      # TAG — push build/<X.Y.Z> on success. Anchored on Android
-      # version per the design; falls back to iOS only when
-      # Android wasn't built this run. Idempotent: skips if tag
-      # already points at HEAD; errors if it points elsewhere.
+      # TAGS — push build/android/<X.Y.Z> and/or build/ios/<X.Y.Z>.
+      # Per-platform tags let each platform's history advance
+      # independently so iOS QA gets the right changelog even
+      # when iOS ships from the same SHA Android already tagged.
+      #
+      # Idempotent: re-runs at the same SHA are a no-op; a tag
+      # collision at a different SHA fails loudly (real config
+      # error, never silent overwrite).
       # ───────────────────────────────────────────────────────
-      - name: Push build tag
+      - name: Configure git for tagging
         if: inputs.android_version_full != '' || inputs.ios_version_full != ''
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+
+      - name: Push Android build tag
+        if: inputs.android_version_full != ''
         env:
-          ANDROID_VERSION_FULL: ${{ inputs.android_version_full }}
-          IOS_VERSION_FULL: ${{ inputs.ios_version_full }}
+          VERSION_FULL: ${{ inputs.android_version_full }}
           RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
           HEAD_SHA: ${{ steps.range.outputs.head_sha }}
         run: |
-          if [ -n "$ANDROID_VERSION_FULL" ]; then
-            TAG_VERSION="$ANDROID_VERSION_FULL"
-          else
-            TAG_VERSION="$IOS_VERSION_FULL"
-          fi
-          TAG="build/$TAG_VERSION"
+          TAG="build/android/$VERSION_FULL"
 
-          # Idempotency: re-runs against the same SHA should be a no-op,
-          # but a collision at a different SHA is a real configuration
-          # error and must fail loudly.
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             EXISTING=$(git rev-list -n1 "$TAG")
             if [ "$EXISTING" = "$HEAD_SHA" ]; then
@@ -415,40 +451,56 @@ jobs:
             exit 1
           fi
 
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name  "github-actions[bot]"
-
-          # Annotated tag with the changelog as the message — handy for `git tag -n`.
           MSG_FILE=$(mktemp)
-          printf 'Build %s\n\n%s\n' "$TAG_VERSION" "$RELEASE_NOTES" > "$MSG_FILE"
+          printf 'Build %s (Android)\n\n%s\n' "$VERSION_FULL" "$RELEASE_NOTES" > "$MSG_FILE"
+          git tag -a "$TAG" -F "$MSG_FILE" "$HEAD_SHA"
+          git push origin "$TAG"
+          echo "✓ Pushed tag $TAG → $HEAD_SHA"
+
+      - name: Push iOS build tag
+        if: inputs.ios_version_full != ''
+        env:
+          VERSION_FULL: ${{ inputs.ios_version_full }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
+          HEAD_SHA: ${{ steps.range.outputs.head_sha }}
+        run: |
+          TAG="build/ios/$VERSION_FULL"
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            EXISTING=$(git rev-list -n1 "$TAG")
+            if [ "$EXISTING" = "$HEAD_SHA" ]; then
+              echo "Tag $TAG already exists at HEAD — skipping"
+              exit 0
+            fi
+            echo "::error::Tag $TAG already exists at $EXISTING (HEAD is $HEAD_SHA). Refusing to overwrite."
+            exit 1
+          fi
+
+          MSG_FILE=$(mktemp)
+          printf 'Build %s (iOS)\n\n%s\n' "$VERSION_FULL" "$RELEASE_NOTES" > "$MSG_FILE"
           git tag -a "$TAG" -F "$MSG_FILE" "$HEAD_SHA"
           git push origin "$TAG"
           echo "✓ Pushed tag $TAG → $HEAD_SHA"
 
       # ───────────────────────────────────────────────────────
-      # RELEASE — surface the build in the Releases tab with
-      # the changelog rendered as markdown. Same content as the
-      # tag annotation, but vastly more browsable.
+      # RELEASES — one per platform that shipped. The release
+      # body is the changelog markdown — renders properly in the
+      # Releases tab. Title format "Build X.Y.Z (Android|iOS)"
+      # makes the platform obvious at a glance in the list view.
       #
       # Idempotent: if a release already exists for this tag
       # (e.g. someone re-ran after deleting just the tag), we
       # skip rather than fail.
       # ───────────────────────────────────────────────────────
-      - name: Create GitHub release
-        if: inputs.android_version_full != '' || inputs.ios_version_full != ''
+      - name: Create Android GitHub release
+        if: inputs.android_version_full != ''
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          ANDROID_VERSION_FULL: ${{ inputs.android_version_full }}
-          IOS_VERSION_FULL: ${{ inputs.ios_version_full }}
+          VERSION_FULL: ${{ inputs.android_version_full }}
           RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
         run: |
-          if [ -n "$ANDROID_VERSION_FULL" ]; then
-            TAG_VERSION="$ANDROID_VERSION_FULL"
-          else
-            TAG_VERSION="$IOS_VERSION_FULL"
-          fi
-          TAG="build/$TAG_VERSION"
+          TAG="build/android/$VERSION_FULL"
 
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release for $TAG already exists — skipping"
@@ -459,6 +511,29 @@ jobs:
           printf '%s\n' "$RELEASE_NOTES" > "$NOTES_FILE"
           gh release create "$TAG" \
             --repo "$REPO" \
-            --title "Build $TAG_VERSION" \
+            --title "Build $VERSION_FULL (Android)" \
+            --notes-file "$NOTES_FILE"
+          echo "✓ Created GitHub release for $TAG"
+
+      - name: Create iOS GitHub release
+        if: inputs.ios_version_full != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION_FULL: ${{ inputs.ios_version_full }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
+        run: |
+          TAG="build/ios/$VERSION_FULL"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release for $TAG already exists — skipping"
+            exit 0
+          fi
+
+          NOTES_FILE=$(mktemp)
+          printf '%s\n' "$RELEASE_NOTES" > "$NOTES_FILE"
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "Build $VERSION_FULL (iOS)" \
             --notes-file "$NOTES_FILE"
           echo "✓ Created GitHub release for $TAG"
