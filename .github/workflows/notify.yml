@@ -424,3 +424,41 @@ jobs:
           git tag -a "$TAG" -F "$MSG_FILE" "$HEAD_SHA"
           git push origin "$TAG"
           echo "✓ Pushed tag $TAG → $HEAD_SHA"
+
+      # ───────────────────────────────────────────────────────
+      # RELEASE — surface the build in the Releases tab with
+      # the changelog rendered as markdown. Same content as the
+      # tag annotation, but vastly more browsable.
+      #
+      # Idempotent: if a release already exists for this tag
+      # (e.g. someone re-ran after deleting just the tag), we
+      # skip rather than fail.
+      # ───────────────────────────────────────────────────────
+      - name: Create GitHub release
+        if: inputs.android_version_full != '' || inputs.ios_version_full != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ANDROID_VERSION_FULL: ${{ inputs.android_version_full }}
+          IOS_VERSION_FULL: ${{ inputs.ios_version_full }}
+          RELEASE_NOTES: ${{ steps.changelog.outputs.release_notes_md }}
+        run: |
+          if [ -n "$ANDROID_VERSION_FULL" ]; then
+            TAG_VERSION="$ANDROID_VERSION_FULL"
+          else
+            TAG_VERSION="$IOS_VERSION_FULL"
+          fi
+          TAG="build/$TAG_VERSION"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release for $TAG already exists — skipping"
+            exit 0
+          fi
+
+          NOTES_FILE=$(mktemp)
+          printf '%s\n' "$RELEASE_NOTES" > "$NOTES_FILE"
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "Build $TAG_VERSION" \
+            --notes-file "$NOTES_FILE"
+          echo "✓ Created GitHub release for $TAG"
