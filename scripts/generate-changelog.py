@@ -56,6 +56,9 @@ ANTHROPIC_MAX_TOKENS = 4096
 PR_BODY_CHAR_CAP = 2000
 PR_FILES_CAP = 30
 PR_COMMITS_CAP = 50
+# Per-commit body cap. Most useful detail is in the first few lines; a stack
+# trace pasted into a body would otherwise eat the whole prompt.
+COMMIT_BODY_CAP = 500
 
 # Default high-risk paths — sensible for any mobile game project. Override
 # per-project via HIGH_RISK_PATHS env.
@@ -76,19 +79,50 @@ DEFAULT_HIGH_RISK_PATHS = [
 
 
 @dataclass
+class CommitInfo:
+    """One commit's headline + body for prompt rendering."""
+
+    subject: str
+    body: str  # empty string when commit has no body
+
+
+def _truncate_body(body: str) -> str:
+    """Cap one commit body to keep the prompt bounded. Returns empty for None/empty."""
+    if not body:
+        return ""
+    body = body.strip()
+    if len(body) > COMMIT_BODY_CAP:
+        body = body[:COMMIT_BODY_CAP].rstrip() + " …[truncated]"
+    return body
+
+
+def _render_commit_with_body(subject: str, body: str, indent: str = "  ") -> str:
+    """Render a commit as one bullet line + optional indented body block."""
+    head = f"{indent}- {subject}"
+    if not body:
+        return head
+    body_lines = "\n".join(f"{indent}    {line}" for line in body.splitlines())
+    return f"{head}\n{body_lines}"
+
+
+@dataclass
 class PullRequest:
     number: int
     title: str
     body: str
     author: str
-    commits: list[str]  # subjects only
+    commits: list[CommitInfo]
     files: list[str]  # paths only
 
     def to_prompt_block(self) -> str:
         body = self.body or "(no description)"
         if len(body) > PR_BODY_CHAR_CAP:
             body = body[:PR_BODY_CHAR_CAP] + " …[truncated]"
-        commit_lines = "\n".join(f"  - {c}" for c in self.commits[:PR_COMMITS_CAP])
+        commit_blocks = [
+            _render_commit_with_body(c.subject, c.body)
+            for c in self.commits[:PR_COMMITS_CAP]
+        ]
+        commit_lines = "\n".join(commit_blocks)
         if len(self.commits) > PR_COMMITS_CAP:
             commit_lines += f"\n  - …({len(self.commits) - PR_COMMITS_CAP} more commits)"
         file_lines = "\n".join(f"  - {f}" for f in self.files[:PR_FILES_CAP])
@@ -107,10 +141,15 @@ class PullRequest:
 class DirectCommit:
     sha: str
     subject: str
+    body: str  # empty when commit has no body
     author: str
 
     def to_prompt_block(self) -> str:
-        return f"- {self.sha[:7]} | {self.author} | {self.subject}"
+        head = f"- {self.sha[:7]} | {self.author} | {self.subject}"
+        if not self.body:
+            return head
+        body_lines = "\n".join(f"    {line}" for line in self.body.splitlines())
+        return f"{head}\n{body_lines}"
 
 
 @dataclass
@@ -173,25 +212,43 @@ def merge_commits_in_range(from_ref: str, to_ref: str) -> list[tuple[str, str]]:
     return [tuple(line.split("\t", 1)) for line in out.splitlines() if line.strip()]
 
 
-def first_parent_non_merge_commits(from_ref: str, to_ref: str) -> list[tuple[str, str, str]]:
-    """Non-merge commits on first-parent path: (sha, subject, author_name)."""
+def first_parent_non_merge_commits(
+    from_ref: str, to_ref: str
+) -> list[tuple[str, str, str, str]]:
+    """Non-merge commits on first-parent path: (sha, subject, body, author_name).
+
+    Uses `-z` so records are separated by NUL instead of newlines — necessary
+    because commit bodies (`%b`) contain newlines themselves and would
+    otherwise break a line-based parser.
+    """
     out = run(
         [
             "git",
             "log",
+            "-z",
             "--first-parent",
             "--no-merges",
             f"{from_ref}..{to_ref}",
-            "--pretty=format:%H%x09%s%x09%an",
+            "--pretty=format:%H%x09%s%x09%an%x09%b",
         ]
     )
-    rows = []
-    for line in out.splitlines():
-        if not line.strip():
+    rows: list[tuple[str, str, str, str]] = []
+    # `-z` separates records with NUL. Within each record, fields are tab-
+    # separated. The body is the last field, may contain newlines, but not
+    # tabs in any realistic commit message — so split is safe with maxsplit=3.
+    for rec in out.split("\0"):
+        rec = rec.strip("\n")
+        if not rec.strip():
             continue
-        parts = line.split("\t", 2)
-        if len(parts) == 3:
-            rows.append(tuple(parts))
+        parts = rec.split("\t", 3)
+        if len(parts) == 4:
+            sha, subject, author, body = parts
+        elif len(parts) == 3:
+            sha, subject, author = parts
+            body = ""
+        else:
+            continue
+        rows.append((sha, subject, _truncate_body(body), author))
     return rows
 
 
@@ -237,16 +294,24 @@ def fetch_pr(repo: str, number: int) -> PullRequest | None:
     except json.JSONDecodeError:
         sys.stderr.write(f"WARN: gh pr view #{number} returned non-JSON\n")
         return None
+    commit_infos: list[CommitInfo] = []
+    for c in data.get("commits") or []:
+        subject = (c.get("messageHeadline") or "").strip()
+        if not subject:
+            continue
+        commit_infos.append(
+            CommitInfo(
+                subject=subject,
+                body=_truncate_body(c.get("messageBody") or ""),
+            )
+        )
+
     return PullRequest(
         number=data["number"],
         title=data.get("title", "") or "",
         body=data.get("body", "") or "",
         author=(data.get("author") or {}).get("login", "unknown"),
-        commits=[
-            (c.get("messageHeadline") or "").strip()
-            for c in (data.get("commits") or [])
-            if c.get("messageHeadline")
-        ],
+        commits=commit_infos,
         files=[
             (f.get("path") or "").strip()
             for f in (data.get("files") or [])
@@ -736,7 +801,7 @@ def main() -> int:
 
     direct_rows = first_parent_non_merge_commits(from_ref, to_ref)
     direct: list[DirectCommit] = []
-    for sha, subject, author in direct_rows:
+    for sha, subject, body, author in direct_rows:
         n = parse_pr_number_from_subject(subject)
         if n:
             # Squash-merged PR — track via gh, don't treat as a direct commit.
@@ -744,7 +809,9 @@ def main() -> int:
                 pr_numbers.append(n)
                 seen_prs.add(n)
             continue
-        direct.append(DirectCommit(sha=sha, subject=subject, author=author))
+        direct.append(
+            DirectCommit(sha=sha, subject=subject, body=body, author=author)
+        )
 
     if not pr_numbers and not direct:
         return _emit_fallback_or_fail(
