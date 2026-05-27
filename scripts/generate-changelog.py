@@ -290,20 +290,19 @@ OUTPUT REQUIREMENT: Return ONLY a single valid JSON object. No markdown fences, 
 Entry := {{
   "title":    "Short headline, max 60 chars",
   "summary":  "1-2 sentence description of what changed and why QA should care",
-  "qa_steps": ["specific testable behavior", ...],
   "risk":     "low" | "medium" | "high",
   "pr":       <int PR number or null>
 }}
 
 RULES:
-- For each PR, derive ONE entry from PR title + body. Use commit subjects to fill qa_steps. Do NOT enumerate every commit — the goal is "what changed", not a log dump.
+- For each PR, derive ONE entry from PR title + body. Do NOT enumerate every commit — the goal is "what changed", not a log dump.
 - A single PR can have 100 commits but should typically appear as ONE entry in the changelog.
 - If a commit message inside a PR clearly describes work UNRELATED to the PR's main topic (e.g. "fix tutorial bug" inside a Progressbar PR), split it out as its own entry under "fixes" or "other".
 - If a commit subject starts with [Tag] in square brackets, treat that tag as an explicit feature/area override for that commit.
 - "risk": "high" for any change touching these areas (path substrings): {high_risk_paths}. Also "high" for save format changes, network/auth, payment flows. "medium" for gameplay rule changes, economy tuning, new screens. "low" otherwise.
-- "qa_steps": Be exhaustive. Even single-line code changes can have multiple test surfaces (e.g. changing an ad event also affects analytics — test both). List the concrete behaviors a tester should verify.
+- "summary": include enough detail that a tester reading just this line understands WHAT changed and what surfaces it touches. Per-entry test steps are intentionally not requested — concrete test guidance goes in "qa_focus" only.
 - Categorisation: "features" for new functionality, "fixes" for bug repairs, "other" for refactors/build-config/dependency bumps. Skip pure-noise entries (whitespace, comment-only).
-- "qa_focus": 3-6 cross-cutting bullets for things QA should verify across the whole build (e.g. "Save/load roundtrip after each gameplay session", "Test on iOS 15 baseline device").
+- "qa_focus": 3-6 cross-cutting bullets for things QA should verify across the whole build (e.g. "Save/load roundtrip after each gameplay session", "Test on iOS 15 baseline device"). This is the ONLY place test steps appear — make them count.
 - Title rules: imperative or noun-phrase, max 60 chars, no PR-number suffix.
 """
 
@@ -414,11 +413,11 @@ def render_markdown(payload: dict[str, Any]) -> str:
             summary = (e.get("summary") or "").strip()
             if summary:
                 out.append(f"  {summary}")
-            qa_steps = e.get("qa_steps") or []
-            if qa_steps:
-                out.append("  QA:")
-                for step in qa_steps:
-                    out.append(f"    - {step}")
+            # Per-entry QA steps used to be rendered here. QA team asked us to
+            # drop them — the cross-cutting "QA Focus" section at the bottom
+            # is the one place test guidance now appears. The LLM prompt no
+            # longer requests qa_steps either, but we'd just ignore them
+            # gracefully if a model included them anyway.
         sections.append("\n".join(out))
 
     render_section("Features", payload.get("features") or [])
