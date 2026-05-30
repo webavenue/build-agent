@@ -9,14 +9,23 @@ Reusable GitHub Actions workflow repo for building and releasing **Capacitor** (
 ```
 .github/workflows/capacitor-selfhosted.yml  # Reusable workflow for Capacitor apps (self-hosted Mac mini, Android → iOS sequential, automatic iOS signing)
 .github/workflows/unity-selfhosted.yml      # Reusable workflow for Unity projects (self-hosted Mac mini)
+.github/workflows/notify.yml                # Reusable changelog + Asana + Slack + build/* tag (called by unity-selfhosted & external-notify)
+.github/workflows/external-notify.yml       # Reusable: fetch Play/TestFlight versions, then delegate to notify.yml (externally-built projects)
 .github/workflows/claude-review.yml         # Reusable automated PR reviewer (Claude Code Action), tuned per project_type
 fastlane/capacitor/Fastfile                 # SHARED Capacitor Fastlane lanes, imported by caller repos via `import_from_git`
+slack-bot/                                  # Cloudflare Worker backing the Slack `/build` slash command (workflow_dispatch trigger)
+channel-map.json                            # Source-of-truth Slack channel_id → "owner/repo" map; pushed to the bot's CHANNEL_MAP secret
 docs/self-hosted-setup.md                   # Runbook for installing the Mac mini runner + Fastfile changes
 scripts/push-secrets.sh                     # Pushes secrets/variables to target GitHub repos via gh CLI
+scripts/generate-changelog.py               # LLM release-note generation (used by the notify workflows)
+scripts/fetch-store-versions.py             # Queries Play / App Store Connect for latest shipped versions (external-notify)
+Gemfile / Gemfile.lock                      # Pins the fastlane gem set used across projects
+files/                                      # Shared credential files (Apple .p8/.p12/.mobileprovision, Play key) — gitignored
 .secrets.env.example                        # Combined template for shared + project-specific values
-.secrets.env                                # Shared secrets (Slack, Asana) — gitignored, never commit
-<project_name>/
-  .secrets.env                              # Project-specific secrets (keystore, certs, app IDs) — gitignored
+.secrets.env                                # Shared secrets (Apple API key/cert, Play key, Slack, Asana, MAC_LOGIN_PASSWORD, ANTHROPIC_API_KEY, Unity) — gitignored
+<project_name>/                             # One folder per project (idle-truck-fleet, flight-manager, colorwood-associations, …)
+  .secrets.env                              # Project-specific secrets (keystore, app IDs, channel/Asana) — gitignored
+  files/                                    # Project credential files (keystore.jks, google-services.json) — gitignored
 ```
 
 **Secret layering:** root `.secrets.env` is loaded first, then `<project_name>/.secrets.env` on top. Project values override root values for the same key.
@@ -27,6 +36,8 @@ Caller repos reference it like:
 ```yaml
 uses: webavenue/build-agent/.github/workflows/capacitor-selfhosted.yml@main
 ```
+
+> **Org name:** the actual remote is `WebAvenueIG/build-agent` (matching `.secrets.env.example`). The `webavenue/...` slug used in examples here and in existing callers redirects to it on GitHub, so both forms work — prefer `WebAvenueIG/...` for new repos to avoid confusion.
 
 See [docs/self-hosted-setup.md](docs/self-hosted-setup.md) for runner install + the shared Fastfile mechanism.
 
@@ -50,8 +61,8 @@ import_from_git(
 
 **Per-repo files that stay** (NOT centralised):
 - `Gemfile` / `Gemfile.lock` — pins fastlane gem version
-- `fastlane/Appfile` — project-specific app_identifier / package_name (read from env)
-- `fastlane/Pluginfile` — any project-specific Fastlane plugins
+- `fastlane/Appfile` *(optional)* — only if a project needs a static app_identifier. Current projects skip it: the shared lanes read `IOS_BUNDLE_ID` / `ANDROID_PACKAGE_NAME` from env, so the working callers (flight-manager, idle-truck-fleet) ship just `fastlane/Fastfile`.
+- `fastlane/Pluginfile` *(optional)* — only if a project needs extra Fastlane plugins.
 
 **Project-specific overrides** (e.g. extra `before_all` setup) can go in the caller Fastfile after the `import_from_git` call.
 
@@ -63,9 +74,12 @@ import_from_git(
 | `action` | `"build + upload"` | `"build + upload"` or `"build only"` |
 | `build_android` | `true` | Whether to build the Android app |
 | `build_ios` | `true` | Whether to build the iOS app |
+| `do_asana` | `true` | Create Asana QA tasks (skipped for `build only`) |
+| `do_slack` | `true` | Send the Slack build notification |
 | `version_name` | `"1.0.0"` | Semantic version string |
-| `release_notes` | `"Bug fixes..."` | Changelog text for stores |
-| `version_code_offset` | `100` | Added to `github.run_number` to compute build code |
+| `release_notes` | `"Bug fixes..."` | Fallback notes when `auto_changelog` is off or auto-generation finds nothing |
+| `auto_changelog` | `true` | Auto-generate release notes from commits since the last build tag via Claude; falls back to `release_notes` |
+| `version_code_offset` | `100` | Added to `github.run_number` to compute build code (fallback only — auto-versioning from the stores is the default) |
 
 > **Note:** iOS job only runs on `action: "build + upload"` — there is no build-only option for iOS.
 
@@ -120,6 +134,25 @@ DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
     If either lane is absent or fails, that platform's job silently falls back to `version_code_offset + run_number`. Resolved codes are exposed as `needs.android.outputs.version_code` and `needs.ios.outputs.version_code`, consumed by their respective Asana QA tasks, the Slack message (shows both when they diverge — `Version: 1.2.3 (Android 158 · iOS 42)`), and the `build-<N>` release tag (prefers Android, falls back to iOS).
 - **Notifications:** After both Android and iOS jobs finish, a notify job creates Asana QA tasks and posts a Slack message with build status, download links, and release notes. Notify runs on ubuntu-latest (no benefit to self-hosting it, and it frees the Mac mini for build jobs).
 - **Failure diagnosis:** On Android or iOS failure, the notify job pulls the failed-step logs via `gh run view --log-failed`, asks Claude Haiku 4.5 for a 2–4 sentence plain-English diagnosis, and posts it as a threaded reply to the Slack failure message. Requires `ANTHROPIC_API_KEY` on the caller repo; silently skipped if absent. Needs `actions: read` permission on the notify job (already declared).
+
+## Notify workflows (`notify.yml` / `external-notify.yml`)
+
+Standalone reusable workflows, separate from the inline notify job inside `capacitor-selfhosted.yml`:
+
+- **`notify.yml`** — generates a QA changelog from commits since the last `build/*` tag, creates one Asana QA task per platform built, posts a Slack message, and pushes a new `build/<X.Y.Z>` tag. Called by `unity-selfhosted.yml` and `external-notify.yml`. Caller must grant `contents: write` so the tag push succeeds. Either platform's version input may be `""` to mark it "not built" — the matching Asana task is skipped and the Slack message adapts.
+- **`external-notify.yml`** — for projects an **external studio** builds and uploads (e.g. `colorwood-associations`). It first queries Google Play (internal track) + App Store Connect (latest TestFlight build) to learn what the external CI shipped, validates the `X.Y.Z` format (fails on malformed), then delegates to `notify.yml`. We never build these — only the changelog + QA artefacts are generated afterward.
+
+`capacitor-selfhosted.yml` does NOT use these — it has its own inline notify job. They exist for the Unity and external-studio paths.
+
+## Slack `/build` bot (`slack-bot/`)
+
+A Cloudflare Worker (`build-agent-slack-bot`) that turns a Slack slash command into a GitHub `workflow_dispatch`, so anyone can ship a build from Slack without opening the Actions tab.
+
+- **Command:** `/build <android|ios|both> <version> [branch]` — e.g. `/build android 1.2.3` or `/build both 1.2.3 main`. Version must be `X.Y.Z`; omitting the branch uses `DEFAULT_REF`.
+- **Channel → repo mapping** lives in the **`CHANNEL_MAP` Worker secret** (JSON: `{"C0123ABC":"webavenue/flight-manager", …}`), keyed by Slack **channel ID** (the same value as the project's `SLACK_CHANNEL_ID`). `channel-map.json` in the repo root is the human-maintained source of truth — it is **NOT** read at runtime, so editing it alone does nothing; you must push it to the secret.
+- **Onboarding a new project:** add the entry to `channel-map.json`, then from `slack-bot/` run `npx wrangler secret put CHANNEL_MAP < ../channel-map.json`. Takes effect immediately — no redeploy. The bot's `GITHUB_TOKEN` must have `actions: write` on the new repo.
+- **Worker config (`wrangler.toml`):** `WORKFLOW_FILE=build.yml`, `DEFAULT_REF=develop` — so the dispatched workflow must exist on `develop` (or pass a branch as the 3rd arg). Secrets set via `wrangler secret put`: `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `CHANNEL_MAP`.
+- **Deploy / debug:** `npm run deploy` (wrangler deploy), `npm run tail` for live logs. Endpoint `POST /slack/build`, healthcheck `GET /healthz`. Requests are HMAC-verified against `SLACK_SIGNING_SECRET` with 5-minute replay protection.
 
 ## Automated PR review (claude-review.yml)
 
