@@ -351,6 +351,54 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+      # Self-contained Slack alert on a HARD block. Fires only when the gate
+      # step failed (deterministic/live blocker → exit 1). The normal `notify`
+      # job can't cover this case because android+ios are skipped when the gate
+      # blocks, so it never runs. AI advisory findings do NOT trigger this (they
+      # never fail the gate). Reads the blocking reasons straight from verdict.json.
+      - name: Slack — integration gate blocked
+        if: ${{ failure() && steps.detect.outputs.present == 'true' && inputs.do_slack }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${SLACK_BOT_TOKEN:-}" ] || [ -z "${SLACK_CHANNEL_ID:-}" ]; then
+            echo "⚠ SLACK_BOT_TOKEN/SLACK_CHANNEL_ID not set — skipping gate-block alert."
+            exit 0
+          fi
+          VERDICT="qa/reports/verdict.json"
+          REASONS=""
+          COUNT="?"
+          if [ -f "$VERDICT" ]; then
+            REASONS=$(jq -r '.results[]
+              | select(.severity=="block" and (.status=="fail" or .status=="uncertain"))
+              | "• [\(.service)] \(.title) — \(.detail)"' "$VERDICT" 2>/dev/null | head -10)
+            COUNT=$(jq -r '[.results[]
+              | select(.severity=="block" and (.status=="fail" or .status=="uncertain"))] | length' \
+              "$VERDICT" 2>/dev/null || echo "?")
+          fi
+          if [ -z "$REASONS" ]; then
+            REASONS="• (gate step errored before writing a verdict — see the run log)"
+          fi
+          APP="${APP_NAME:-app}"
+          TEXT=$(printf ':no_entry: *Integration gate BLOCKED* — build stopped before building.\n*App:* %s   *Branch:* %s\n*Blocking issues (%s):*\n%s\n\n<%s|View run>' \
+            "$APP" "$BRANCH" "$COUNT" "$REASONS" "$RUN_URL")
+          PAYLOAD=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$TEXT" \
+            '{channel: $channel, text: $text, unfurl_links: false}')
+          RESPONSE=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -d "$PAYLOAD")
+          if [ "$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null)" = "true" ]; then
+            echo "✓ Gate-block Slack alert sent."
+          else
+            echo "⚠ Slack post failed: $(echo "$RESPONSE" | head -c 300)"
+          fi
+
   # ───────────────────────────────────────────────────────────
   # ANDROID — self-hosted Mac mini
   #
