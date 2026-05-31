@@ -82,6 +82,10 @@ jobs:
   # ───────────────────────────────────────────────────────────
   changelog:
     name: Generate changelog
+    # Gate FIRST: only generate release notes (a paid Claude call) AFTER the
+    # integration gate passes — no point spending it if the build will be blocked.
+    # If the gate fails/blocks, this job is skipped, which skips android + ios too.
+    needs: integration_gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
