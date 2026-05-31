@@ -255,7 +255,11 @@ jobs:
           fi
 
   # ───────────────────────────────────────────────────────────
-  # INTEGRATION GATE — pre-build static QA gate (ubuntu, cheap).
+  # INTEGRATION GATE — pre-build static QA gate.
+  #
+  # Runs on the SELF-HOSTED Mac mini (same as the build jobs) so it consumes
+  # ZERO GitHub-hosted minutes. The Phase-2 review goes through the direct
+  # Anthropic API (ANTHROPIC_API_KEY) — no `claude` CLI needed on the runner.
   #
   # Runs the CALLER repo's qa/ gate BEFORE any build job:
   #   1. deterministic checks ($0) + live store-config checks (--live)
@@ -275,7 +279,7 @@ jobs:
   # ───────────────────────────────────────────────────────────
   integration_gate:
     name: Pre-build integration gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: read
     steps:
@@ -298,11 +302,12 @@ jobs:
             echo "ℹ No qa/run.mjs in this repo — skipping gate (non-blocking)."
           fi
 
-      - name: Set up Node
+      # Self-hosted: use the host's Node (already required by the build jobs).
+      - name: Verify host node
         if: steps.detect.outputs.present == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+        run: |
+          command -v node >/dev/null 2>&1 || { echo "✗ node not found on self-hosted runner — see docs/self-hosted-setup.md"; exit 1; }
+          echo "node $(node --version)"
 
       - name: Decode store credentials (best-effort, for --live)
         if: steps.detect.outputs.present == 'true'
@@ -326,8 +331,9 @@ jobs:
 
       - name: Run gate (deterministic + live → AI review if clean)
         if: steps.detect.outputs.present == 'true'
+        timeout-minutes: 10
         env:
-          # Phase 2 (AI) semantic review — real API billing in CI via this key.
+          # Phase 2 (AI) semantic review — direct Anthropic API, billed to this key.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # Live store-config checks (degrade to warn on missing creds / API error).
           GOOGLE_PLAY_JSON_KEY_PATH: ${{ github.workspace }}/ci-certs/google-play-key.json
