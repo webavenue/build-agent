@@ -66,10 +66,15 @@ on:
         required: false
         default: 100
       integration_gate:
-        description: "Run the caller repo's qa/ pre-build integration gate (deterministic + live store checks, then a Claude semantic review) before building. Deterministic/live failures block the build; AI findings are advisory. Self-skips if the repo has no qa/run.mjs."
+        description: "Run the caller repo's qa/ pre-build integration gate (deterministic + live store checks, then an AI semantic review) before building. Deterministic/live failures block the build; AI findings are advisory. Self-skips if the repo has no qa/run.mjs."
         type: boolean
         required: false
         default: true
+      llm_provider:
+        description: "Which LLM backend the qa/ Phase-2 semantic review uses: 'api' = direct Anthropic API (default, billed to ANTHROPIC_API_KEY), or 'cursor' = Cursor Composer 2.5 Standard (billed at Cursor API rates; requires the CURSOR_API_KEY secret AND cursor-agent installed on the self-hosted runner). With 'cursor' selected but a prerequisite missing, the review degrades to a non-blocking 'review unavailable' — it never blocks a build on its own."
+        type: string
+        required: false
+        default: 'api'
 
 # ─────────────────────────────────────────────────────────────
 # JOBS
@@ -262,8 +267,11 @@ jobs:
   # INTEGRATION GATE — pre-build static QA gate.
   #
   # Runs on the SELF-HOSTED Mac mini (same as the build jobs) so it consumes
-  # ZERO GitHub-hosted minutes. The Phase-2 review goes through the direct
-  # Anthropic API (ANTHROPIC_API_KEY) — no `claude` CLI needed on the runner.
+  # ZERO GitHub-hosted minutes. The Phase-2 review backend is selectable via the
+  # `llm_provider` input: 'api' (default) = the direct Anthropic API
+  # (ANTHROPIC_API_KEY, no `claude` CLI needed on the runner); 'cursor' = Cursor
+  # Composer 2.5 (needs CURSOR_API_KEY + cursor-agent on the runner). Either way
+  # an unavailable backend degrades to a non-blocking "review unavailable".
   #
   # Runs the CALLER repo's qa/ gate BEFORE any build job:
   #   1. deterministic checks ($0) + live store-config checks (--live)
@@ -337,8 +345,13 @@ jobs:
         if: steps.detect.outputs.present == 'true'
         timeout-minutes: 10
         env:
-          # Phase 2 (AI) semantic review — direct Anthropic API, billed to this key.
+          # Phase 2 (AI) semantic review backend, selected by the llm_provider
+          # input: 'api' (direct Anthropic API, default) or 'cursor' (Composer 2.5).
+          # The adapter degrades to a non-blocking "review unavailable" if the chosen
+          # backend's auth/CLI is missing, so a misconfigured toggle never blocks.
+          QA_LLM_PROVIDER: ${{ inputs.llm_provider }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           # Live store-config checks (degrade to warn on missing creds / API error).
           GOOGLE_PLAY_JSON_KEY_PATH: ${{ github.workspace }}/ci-certs/google-play-key.json
           APPLE_API_KEY_PATH: ${{ github.workspace }}/ci-certs/apple-api-key.p8
