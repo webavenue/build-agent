@@ -70,6 +70,11 @@ on:
         type: boolean
         required: false
         default: true
+      e2e_tests:
+        description: "Run the caller repo's Playwright e2e suite BEFORE the integration gate. A failing suite blocks the build (gate + build are skipped, nothing is spent). Self-skips (non-blocking) if the repo has no playwright config."
+        type: boolean
+        required: false
+        default: true
       llm_provider:
         description: "Which LLM backend the qa/ Phase-2 semantic review uses: 'api' = direct Anthropic API (default, billed to ANTHROPIC_API_KEY), or 'cursor' = Cursor Composer 2.5 Standard (billed at Cursor API rates; requires the CURSOR_API_KEY secret AND cursor-agent installed on the self-hosted runner). With 'cursor' selected but a prerequisite missing, the review degrades to a non-blocking 'review unavailable' — it never blocks a build on its own."
         type: string
@@ -264,6 +269,119 @@ jobs:
           fi
 
   # ───────────────────────────────────────────────────────────
+  # E2E — Playwright end-to-end suite, the FIRST gate in the pipeline.
+  #
+  # Runs the CALLER repo's Playwright suite (`npm run e2e`) on the SELF-HOSTED
+  # Mac mini BEFORE the integration gate. A real test failure exits 1 → this job
+  # fails → integration_gate (which `needs` it) is skipped, which skips changelog
+  # + android + ios. So a broken build is stopped before any tokens or build
+  # minutes are spent.
+  #
+  # Unlike the gate job, e2e needs the project's node_modules + a Playwright
+  # browser, so it runs `npm ci` + `npx playwright install chromium` itself
+  # (kept out of the gate job, which runs on bare host Node by design).
+  #
+  # The job ends GREEN when it self-skips — toggle off (e2e_tests=false) or the
+  # repo has no playwright config — so projects without an e2e suite are an
+  # instant no-op success and the gate still runs normally for them.
+  # ───────────────────────────────────────────────────────────
+  e2e:
+    name: E2E tests (Playwright)
+    runs-on: [self-hosted, macOS, ARM64]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect e2e suite
+        id: detect
+        env:
+          ENABLED: ${{ inputs.e2e_tests }}
+        run: |
+          if [ "$ENABLED" != "true" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ e2e_tests input is false — skipping e2e (non-blocking)."
+          elif ls playwright.config.* >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "✓ playwright config found — running e2e suite."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ No playwright config in this repo — skipping e2e (non-blocking)."
+          fi
+
+      # Self-hosted: use the host's Node (already required by the build jobs).
+      - name: Verify host node
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          command -v node >/dev/null 2>&1 || { echo "✗ node not found on self-hosted runner — see docs/self-hosted-setup.md"; exit 1; }
+          echo "node $(node --version)"
+
+      # --ignore-scripts=false: keep lifecycle hooks (e.g. patch-package postinstall)
+      # running, mirroring the build jobs. See docs/self-hosted-setup.md §1.
+      - name: Install dependencies
+        if: steps.detect.outputs.present == 'true'
+        run: npm ci --ignore-scripts=false
+
+      # Only chromium — the Playwright config drives a Mobile Chrome (Pixel 5)
+      # project. On macOS no --with-deps (that's Linux apt only).
+      - name: Install Playwright browser (chromium)
+        if: steps.detect.outputs.present == 'true'
+        run: npx playwright install chromium
+
+      # Playwright's webServer spins up the caller's dev server itself; CI=true
+      # selects the config's CI branch (workers=1, retries=1, forbidOnly). GitHub
+      # sets CI automatically, but we pass it explicitly to be unambiguous.
+      - name: Run Playwright e2e
+        if: steps.detect.outputs.present == 'true'
+        timeout-minutes: 15
+        env:
+          CI: 'true'
+        run: npm run e2e
+
+      - name: Upload Playwright report
+        if: ${{ always() && steps.detect.outputs.present == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # Self-contained Slack alert on e2e failure. Mirrors the gate-block alert:
+      # the normal `notify` job can't cover this case because android+ios are
+      # skipped when e2e fails, so it never runs. Short headline + link to the run
+      # (the uploaded Playwright report has the full file:line trace).
+      - name: Slack — e2e tests failed
+        if: ${{ failure() && steps.detect.outputs.present == 'true' && inputs.do_slack }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${SLACK_BOT_TOKEN:-}" ] || [ -z "${SLACK_CHANNEL_ID:-}" ]; then
+            echo "⚠ SLACK_BOT_TOKEN/SLACK_CHANNEL_ID not set — skipping e2e-fail alert."
+            exit 0
+          fi
+          APP="${APP_NAME:-app}"
+          TEXT=$(printf ':no_entry: *E2E tests FAILED* — build stopped before the integration gate.\n*App:* %s   *Branch:* %s\n\n<%s|View run & Playwright report →>' \
+            "$APP" "$BRANCH" "$RUN_URL")
+          PAYLOAD=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$TEXT" \
+            '{channel: $channel, text: $text, unfurl_links: false}')
+          RESPONSE=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -d "$PAYLOAD")
+          if [ "$(echo "$RESPONSE" | jq -r '.ok' 2>/dev/null)" = "true" ]; then
+            echo "✓ E2E-fail Slack alert sent."
+          else
+            echo "⚠ Slack post failed: $(echo "$RESPONSE" | head -c 300)"
+          fi
+
+  # ───────────────────────────────────────────────────────────
   # INTEGRATION GATE — pre-build static QA gate.
   #
   # Runs on the SELF-HOSTED Mac mini (same as the build jobs) so it consumes
@@ -291,6 +409,11 @@ jobs:
   # ───────────────────────────────────────────────────────────
   integration_gate:
     name: Pre-build integration gate
+    # E2E FIRST: only run the gate (and everything downstream) after the Playwright
+    # suite passes. If e2e fails, this job is skipped, which skips changelog +
+    # android + ios too. The e2e job ends GREEN when it self-skips (toggle off /
+    # no playwright config), so the gate still runs normally for those projects.
+    needs: e2e
     runs-on: [self-hosted, macOS, ARM64]
     permissions:
       contents: read
