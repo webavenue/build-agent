@@ -68,6 +68,11 @@ export default {
       do_slack: "true",
       version_name: parsed.version,
     };
+    // Only send integration_gate when SKIPPING. The reusable workflow defaults it to
+    // true, so omitting it keeps existing behaviour — and avoids a 422 "unexpected
+    // input" for any caller repo whose build.yml predates this input. A repo must
+    // expose `integration_gate` in its build.yml for `nogate` to take effect.
+    if (!parsed.gate) inputs.integration_gate = "false";
 
     const ref = parsed.ref ?? env.DEFAULT_REF;
     const dispatch = await dispatchWorkflow(
@@ -88,9 +93,10 @@ export default {
     const platformLabel =
       parsed.android && parsed.ios ? "Android + iOS" : parsed.android ? "Android" : "iOS";
     const actionsUrl = `https://github.com/${repo}/actions/workflows/${env.WORKFLOW_FILE}`;
+    const gateNote = parsed.gate ? "" : " :warning: *QA integration gate skipped.*";
 
     return slackReply(
-      `:rocket: <@${userId}> kicked off a *${platformLabel}* build of \`${repo}\` (\`${ref}\`) — v${parsed.version}. <${actionsUrl}|Watch the run>`,
+      `:rocket: <@${userId}> kicked off a *${platformLabel}* build of \`${repo}\` (\`${ref}\`) — v${parsed.version}.${gateNote} <${actionsUrl}|Watch the run>`,
       "in_channel",
     );
   },
@@ -101,14 +107,28 @@ export default {
 // ─────────────────────────────────────────────────────────────
 
 type ParsedArgs =
-  | { android: boolean; ios: boolean; version: string; ref?: string }
+  | { android: boolean; ios: boolean; version: string; ref?: string; gate: boolean }
   | { error: string };
+
+// Reserved keywords that turn OFF the pre-build QA integration gate (build directly).
+const GATE_SKIP_FLAGS = new Set(["nogate", "no-gate", "skip-gate", "skipgate", "--no-gate"]);
 
 function parseArgs(text: string): ParsedArgs {
   const usage =
-    "Usage: `/build <android|ios|both> <version> [branch]` — e.g. `/build android 1.2.3` or `/build ios 1.2.3 feature/login`";
+    "Usage: `/build <android|ios|both> <version> [branch] [nogate]` — e.g. `/build android 1.2.3`. Add `nogate` to skip the QA integration gate and build directly.";
 
-  const tokens = text.split(/\s+/).filter(Boolean);
+  // Pull flags out FIRST (they can appear anywhere) so `nogate` is never mistaken
+  // for a branch in the positional slots below.
+  let gate = true;
+  const tokens: string[] = [];
+  for (const t of text.split(/\s+/).filter(Boolean)) {
+    if (GATE_SKIP_FLAGS.has(t.toLowerCase())) {
+      gate = false;
+      continue;
+    }
+    tokens.push(t);
+  }
+
   if (tokens.length < 2) return { error: `:x: Missing arguments. ${usage}` };
 
   const raw = tokens[0].toLowerCase();
@@ -142,6 +162,7 @@ function parseArgs(text: string): ParsedArgs {
     ios: platform === "ios" || platform === "both",
     version,
     ref,
+    gate,
   };
 }
 

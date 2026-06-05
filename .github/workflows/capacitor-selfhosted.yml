@@ -387,23 +387,40 @@ jobs:
             echo "⚠ SLACK_BOT_TOKEN/SLACK_CHANNEL_ID not set — skipping gate-block alert."
             exit 0
           fi
+          # Slack is a NOTIFICATION, not the report. We post a short headline — the
+          # blocking count + the DISTINCT services implicated (proper-case labels) —
+          # and link to the GitHub job summary, which already renders the full,
+          # grouped-by-service verdict (report.mjs writes it before exit). No per-
+          # finding dump here: a human clicks through to the real file:line evidence.
           VERDICT="qa/reports/verdict.json"
-          REASONS=""
           COUNT="?"
+          SERVICES=""
           if [ -f "$VERDICT" ]; then
-            REASONS=$(jq -r '.results[]
-              | select(.severity=="block" and (.status=="fail" or .status=="uncertain"))
-              | "• [\(.service)] \(.title) — \(.detail)"' "$VERDICT" 2>/dev/null | head -10)
             COUNT=$(jq -r '[.results[]
               | select(.severity=="block" and (.status=="fail" or .status=="uncertain"))] | length' \
               "$VERDICT" 2>/dev/null || echo "?")
-          fi
-          if [ -z "$REASONS" ]; then
-            REASONS="• (gate step errored before writing a verdict — see the run log)"
+            # Map raw service keys → human labels. Explicit lookup (not title-case):
+            # "iap"→IAP (acronym), "remoteConfig"→Remote Config (camelCase). Unknown
+            # services fall back to capitalize-first so new services still read fine.
+            # NB: `label` is a jq reserved keyword (label/break) — name this `svclabel`.
+            SERVICES=$(jq -r '
+              def svclabel:
+                { "analytics":"Analytics", "iap":"IAP", "ads":"Ads",
+                  "rating":"Rating", "remoteConfig":"Remote Config", "release":"Release"
+                }[.] // ((.[0:1] | ascii_upcase) + .[1:]);
+              [ .results[]
+                | select(.severity=="block" and (.status=="fail" or .status=="uncertain"))
+                | .service | svclabel ]
+              | unique | join(", ")' "$VERDICT" 2>/dev/null || echo "")
           fi
           APP="${APP_NAME:-app}"
-          TEXT=$(printf ':no_entry: *Integration gate BLOCKED* — build stopped before building.\n*App:* %s   *Branch:* %s\n*Blocking issues (%s):*\n%s\n\n<%s|View run>' \
-            "$APP" "$BRANCH" "$COUNT" "$REASONS" "$RUN_URL")
+          if [ -n "$SERVICES" ]; then
+            HEADLINE=$(printf '*%s blocking issue(s)* in: %s' "$COUNT" "$SERVICES")
+          else
+            HEADLINE="(gate step errored before writing a verdict — see the run log)"
+          fi
+          TEXT=$(printf ':no_entry: *Integration gate BLOCKED* — build stopped before building.\n*App:* %s   *Branch:* %s\n%s\n\n<%s|View full verdict →>' \
+            "$APP" "$BRANCH" "$HEADLINE" "$RUN_URL")
           PAYLOAD=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$TEXT" \
             '{channel: $channel, text: $text, unfurl_links: false}')
           RESPONSE=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
