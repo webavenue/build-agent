@@ -1,10 +1,14 @@
 // ─────────────────────────────────────────────────────────────
-// Slack /build slash command → GitHub workflow_dispatch
+// Slack slash commands → GitHub, backed by the shared CHANNEL_MAP.
 //
-// Endpoint:  POST /slack/build
-// Slash cmd: /build <android|ios|both> <version>     e.g. /build android 1.2.3
+//   /build  <android|ios|both> <version>   → workflow_dispatch
+//     Endpoint: POST /slack/build
 //
-// Channel-to-repo mapping lives in the CHANNEL_MAP secret as
+//   /invite-to-repo <github-username>      → repo collaborator invite
+//     Endpoint: POST /slack/invite
+//
+// Both resolve the target repo from the channel the command was run
+// in. Channel-to-repo mapping lives in the CHANNEL_MAP secret as
 // JSON, e.g. { "C0123456789": "webavenue/flight-manager", ... }
 // The channel ID is the Slack-internal ID, not the channel name.
 // ─────────────────────────────────────────────────────────────
@@ -25,7 +29,9 @@ export default {
       return new Response("ok", { status: 200 });
     }
 
-    if (req.method !== "POST" || url.pathname !== "/slack/build") {
+    const isBuild = req.method === "POST" && url.pathname === "/slack/build";
+    const isInvite = req.method === "POST" && url.pathname === "/slack/invite";
+    if (!isBuild && !isInvite) {
       return new Response("Not found", { status: 404 });
     }
 
@@ -40,11 +46,7 @@ export default {
     const userId = params.get("user_id") ?? "";
     const text = (params.get("text") ?? "").trim();
 
-    const parsed = parseArgs(text);
-    if ("error" in parsed) {
-      return slackReply(parsed.error, "ephemeral");
-    }
-
+    // Both commands need the channel → repo mapping, so resolve it up front.
     let channelMap: Record<string, string>;
     try {
       channelMap = JSON.parse(env.CHANNEL_MAP || "{}");
@@ -58,6 +60,17 @@ export default {
         `:x: This channel (\`${channelId}\`) isn't mapped to a repo. Ask an admin to add it to CHANNEL_MAP.`,
         "ephemeral",
       );
+    }
+
+    // ── /invite-to-repo <github-username> ──────────────────────────
+    if (isInvite) {
+      return handleInvite(text, repo, userId, env.GITHUB_TOKEN);
+    }
+
+    // ── /build <android|ios|both> <version> [branch] [nogate] ──────
+    const parsed = parseArgs(text);
+    if ("error" in parsed) {
+      return slackReply(parsed.error, "ephemeral");
     }
 
     const inputs: Record<string, string> = {
@@ -169,6 +182,97 @@ function parseArgs(text: string): ParsedArgs {
     ref,
     gate,
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// /invite-to-repo handler
+//
+// Invites a GitHub user as a collaborator (write access) to the repo
+// mapped to the current channel. No inviter allowlist — anyone in a
+// mapped channel can invite. Reuses GITHUB_TOKEN; that token must have
+// collaborator-management permission on the repo (classic `repo`
+// scope, or a fine-grained PAT with Administration: read & write).
+// ─────────────────────────────────────────────────────────────
+
+async function handleInvite(
+  text: string,
+  repo: string,
+  userId: string,
+  token: string,
+): Promise<Response> {
+  const usage = "Usage: `/invite-to-repo <github-username>` — e.g. `/invite-to-repo octocat`.";
+
+  // First whitespace-bounded token is the username; ignore anything trailing.
+  const username = text.split(/\s+/).filter(Boolean)[0] ?? "";
+  if (!username) {
+    return slackReply(`:x: Missing GitHub username. ${usage}`, "ephemeral");
+  }
+  // GitHub usernames: 1–39 chars, alphanumeric with single internal hyphens.
+  // Loose check here; GitHub rejects anything truly invalid with a 404 below.
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(username)) {
+    return slackReply(`:x: \`${username}\` doesn't look like a valid GitHub username. ${usage}`, "ephemeral");
+  }
+
+  const invite = await inviteCollaborator(repo, username, "push", token);
+
+  switch (invite.status) {
+    case 201:
+      return slackReply(
+        `:white_check_mark: <@${userId}> invited \`${username}\` to \`${repo}\` with *write* access. They'll get an email + GitHub notification to accept. <https://github.com/${repo}/invitations|Pending invites>`,
+        "in_channel",
+      );
+    case 204:
+      return slackReply(
+        `:information_source: \`${username}\` already has access to \`${repo}\` — no invite needed.`,
+        "ephemeral",
+      );
+    case 404:
+      return slackReply(
+        `:x: GitHub user \`${username}\` not found. Double-check the handle (it's their GitHub username, not their display name).`,
+        "ephemeral",
+      );
+    case 403:
+      return slackReply(
+        `:lock: GitHub refused the invite (HTTP 403). The bot's token likely lacks collaborator/Administration permission on \`${repo}\`, or the org blocks outside collaborators.\n\`\`\`${invite.body.slice(0, 300)}\`\`\``,
+        "ephemeral",
+      );
+    default:
+      return slackReply(
+        `:x: GitHub invite failed (HTTP ${invite.status}).\n\`\`\`${invite.body.slice(0, 400)}\`\`\``,
+        "ephemeral",
+      );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// GitHub add/invite collaborator
+// PUT /repos/{owner}/{repo}/collaborators/{username}
+//   201 → invitation created · 204 → already had access
+// ─────────────────────────────────────────────────────────────
+
+async function inviteCollaborator(
+  repo: string,
+  username: string,
+  permission: "pull" | "triage" | "push" | "maintain" | "admin",
+  token: string,
+): Promise<{ status: number; body: string }> {
+  const res = await fetch(
+    `https://api.github.com/repos/${repo}/collaborators/${encodeURIComponent(username)}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "build-agent-slack-bot",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ permission }),
+    },
+  );
+
+  const body = res.ok ? "" : await res.text();
+  return { status: res.status, body };
 }
 
 // ─────────────────────────────────────────────────────────────

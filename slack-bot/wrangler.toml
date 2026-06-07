@@ -1,11 +1,14 @@
-# Cloudflare Worker config for the /build Slack slash-command bot.
+# Cloudflare Worker config for the Slack slash-command bot
+# (/build and /invite-to-repo).
 #
 # Plain vars live here. Secrets are set via `wrangler secret put <NAME>`
 # (or in the Cloudflare dashboard) and never committed:
 #
 #   SLACK_SIGNING_SECRET   Slack app "Signing Secret" (Basic Information page)
-#   GITHUB_TOKEN           PAT or fine-grained token with `actions:write`
-#                          on every repo listed in CHANNEL_MAP
+#   GITHUB_TOKEN           PAT or fine-grained token for every repo in CHANNEL_MAP.
+#                          /build needs `actions:write`. /invite-to-repo also needs
+#                          collaborator management: classic `repo` scope, or a
+#                          fine-grained PAT with Administration: read & write.
 #   CHANNEL_MAP            JSON map of Slack channel_id → "owner/repo", e.g.
 #                          {"C0123ABC":"webavenue/flight-manager",
 #                           "C0456DEF":"webavenue/golf-tycoon"}

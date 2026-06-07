@@ -144,15 +144,17 @@ Standalone reusable workflows, separate from the inline notify job inside `capac
 
 `capacitor-selfhosted.yml` does NOT use these — it has its own inline notify job. They exist for the Unity and external-studio paths.
 
-## Slack `/build` bot (`slack-bot/`)
+## Slack bot (`slack-bot/`) — `/build` + `/invite-to-repo`
 
-A Cloudflare Worker (`build-agent-slack-bot`) that turns a Slack slash command into a GitHub `workflow_dispatch`, so anyone can ship a build from Slack without opening the Actions tab.
+A single Cloudflare Worker (`build-agent-slack-bot`) backing two slash commands. Both resolve the target repo from the channel the command runs in via the shared `CHANNEL_MAP`, so no repo argument is ever typed.
 
-- **Command:** `/build <android|ios|both> <version> [branch]` — e.g. `/build android 1.2.3` or `/build both 1.2.3 main`. Version must be `X.Y.Z`; omitting the branch uses `DEFAULT_REF`.
+- **`/build <android|ios|both> <version> [branch] [nogate]`** → GitHub `workflow_dispatch`, so anyone can ship a build from Slack without opening the Actions tab. e.g. `/build android 1.2.3` or `/build both 1.2.3 main`. Version must be `X.Y.Z`; omitting the branch uses `DEFAULT_REF`. Endpoint `POST /slack/build`.
+- **`/invite-to-repo <github-username>`** → adds that GitHub user as a **write** collaborator on the channel's repo (`PUT /repos/{owner}/{repo}/collaborators/{username}`, `permission: push`). e.g. `/invite-to-repo octocat`. Takes a GitHub **username**, not an email. **No inviter allowlist** — anyone in a mapped channel can invite (deliberate; revisit if it's abused). Replies `in_channel` on success (201) for an audit trail; ephemeral for already-a-collaborator (204), unknown user (404), or permission errors (403). Endpoint `POST /slack/invite`.
 - **Channel → repo mapping** lives in the **`CHANNEL_MAP` Worker secret** (JSON: `{"C0123ABC":"webavenue/flight-manager", …}`), keyed by Slack **channel ID** (the same value as the project's `SLACK_CHANNEL_ID`). `channel-map.json` in the repo root is the human-maintained source of truth — it is **NOT** read at runtime, so editing it alone does nothing; you must push it to the secret.
-- **Onboarding a new project:** add the entry to `channel-map.json`, then from `slack-bot/` run `npx wrangler secret put CHANNEL_MAP < ../channel-map.json`. Takes effect immediately — no redeploy. The bot's `GITHUB_TOKEN` must have `actions: write` on the new repo.
+- **Onboarding a new project:** add the entry to `channel-map.json`, then from `slack-bot/` run `npx wrangler secret put CHANNEL_MAP < ../channel-map.json`. Takes effect immediately — no redeploy.
+- **`GITHUB_TOKEN` permissions:** `/build` needs `actions: write`; `/invite-to-repo` also needs collaborator management — classic `repo` scope, or a fine-grained PAT with **Administration: read & write** — on every repo in `CHANNEL_MAP`. A token that's actions-only will surface a 403 in the Slack reply on invite.
 - **Worker config (`wrangler.toml`):** `WORKFLOW_FILE=build.yml`, `DEFAULT_REF=develop` — so the dispatched workflow must exist on `develop` (or pass a branch as the 3rd arg). Secrets set via `wrangler secret put`: `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `CHANNEL_MAP`.
-- **Deploy / debug:** `npm run deploy` (wrangler deploy), `npm run tail` for live logs. Endpoint `POST /slack/build`, healthcheck `GET /healthz`. Requests are HMAC-verified against `SLACK_SIGNING_SECRET` with 5-minute replay protection.
+- **Deploy / debug:** `npm run deploy` (wrangler deploy), `npm run tail` for live logs. Healthcheck `GET /healthz`. All requests are HMAC-verified against `SLACK_SIGNING_SECRET` with 5-minute replay protection.
 
 ## Automated PR review (claude-review.yml)
 
