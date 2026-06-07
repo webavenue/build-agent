@@ -68,11 +68,16 @@ export default {
       do_slack: "true",
       version_name: parsed.version,
     };
-    // Only send integration_gate when SKIPPING. The reusable workflow defaults it to
-    // true, so omitting it keeps existing behaviour — and avoids a 422 "unexpected
-    // input" for any caller repo whose build.yml predates this input. A repo must
-    // expose `integration_gate` in its build.yml for `nogate` to take effect.
-    if (!parsed.gate) inputs.integration_gate = "false";
+    // Only send the gate inputs when SKIPPING. The reusable workflow defaults both
+    // to true, so omitting them keeps existing behaviour — and avoids a 422
+    // "unexpected input" for any caller repo whose build.yml predates these inputs.
+    // The skip flag bypasses BOTH pre-build gates: e2e_tests (Phase 1, Playwright)
+    // and integration_gate (Phase 2, qa/). A repo must expose both inputs in its
+    // build.yml for `nogate` to take effect on each.
+    if (!parsed.gate) {
+      inputs.e2e_tests = "false";
+      inputs.integration_gate = "false";
+    }
 
     const ref = parsed.ref ?? env.DEFAULT_REF;
     const dispatch = await dispatchWorkflow(
@@ -93,7 +98,7 @@ export default {
     const platformLabel =
       parsed.android && parsed.ios ? "Android + iOS" : parsed.android ? "Android" : "iOS";
     const actionsUrl = `https://github.com/${repo}/actions/workflows/${env.WORKFLOW_FILE}`;
-    const gateNote = parsed.gate ? "" : " :warning: *QA integration gate skipped.*";
+    const gateNote = parsed.gate ? "" : " :warning: *Pre-build gates skipped (e2e + integration gate).*";
 
     return slackReply(
       `:rocket: <@${userId}> kicked off a *${platformLabel}* build of \`${repo}\` (\`${ref}\`) — v${parsed.version}.${gateNote} <${actionsUrl}|Watch the run>`,
@@ -115,7 +120,7 @@ const GATE_SKIP_FLAGS = new Set(["nogate", "no-gate", "skip-gate", "skipgate", "
 
 function parseArgs(text: string): ParsedArgs {
   const usage =
-    "Usage: `/build <android|ios|both> <version> [branch] [nogate]` — e.g. `/build android 1.2.3`. Add `nogate` to skip the QA integration gate and build directly.";
+    "Usage: `/build <android|ios|both> <version> [branch] [nogate]` — e.g. `/build android 1.2.3`. Add `nogate` to skip both pre-build gates (Playwright e2e + QA integration gate) and build directly.";
 
   // Pull flags out FIRST (they can appear anywhere) so `nogate` is never mistaken
   // for a branch in the positional slots below.
