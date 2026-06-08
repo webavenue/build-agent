@@ -1013,6 +1013,7 @@ jobs:
 
           NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
           DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
+          VERSION_FIELD="${VERSION_NAME} (${VERSION_CODE})"   # Asana "Version" text field
 
           REQUEST=$(jq -n \
             --arg name "$TASK_NAME" \
@@ -1021,13 +1022,20 @@ jobs:
             --arg extra_project "$ASANA_PROJECT_ID" \
             --arg assignee "$ASANA_ASSIGNEE_ID" \
             --arg due_on "$DUE_ON" \
+            --arg version "$VERSION_FIELD" \
             '{
               data: {
                 name: $name,
                 notes: $notes,
                 projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
                 assignee: $assignee,
-                due_on: $due_on
+                due_on: $due_on,
+                custom_fields: {
+                  "1200038130204914": "1200603160957685",   # Department IG = QA
+                  "1214780966676034": "1214780966676036",   # Type = Build
+                  "1203895205998375": "1203895205998376",   # Platforms IG = Android
+                  "1205371522841649": $version              # Version (text)
+                }
               }
             }')
 
@@ -1078,6 +1086,7 @@ jobs:
 
           NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
           DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
+          VERSION_FIELD="${VERSION_NAME} (${VERSION_CODE})"   # Asana "Version" text field
 
           REQUEST=$(jq -n \
             --arg name "$TASK_NAME" \
@@ -1086,13 +1095,20 @@ jobs:
             --arg extra_project "$ASANA_PROJECT_ID" \
             --arg assignee "$ASANA_ASSIGNEE_ID" \
             --arg due_on "$DUE_ON" \
+            --arg version "$VERSION_FIELD" \
             '{
               data: {
                 name: $name,
                 notes: $notes,
                 projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
                 assignee: $assignee,
-                due_on: $due_on
+                due_on: $due_on,
+                custom_fields: {
+                  "1200038130204914": "1200603160957685",   # Department IG = QA
+                  "1214780966676034": "1214780966676036",   # Type = Build
+                  "1203895205998375": "1203895205998378",   # Platforms IG = iOS
+                  "1205371522841649": $version              # Version (text)
+                }
               }
             }')
 

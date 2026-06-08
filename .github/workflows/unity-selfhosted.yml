@@ -507,6 +507,8 @@ jobs:
           fi
 
           DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
+          VERSION_FIELD="${VERSION_FULL} (${VERSION_CODE})"   # Asana "Version" text field
+          # custom_fields GIDs → Department IG=QA, Type=Build, Platforms IG=Android, Version(text)
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -516,7 +518,13 @@ jobs:
                 \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
                 \"projects\": ${PROJECTS},
                 \"assignee\": \"${ASANA_ASSIGNEE_ID}\",
-                \"due_on\": \"${DUE_ON}\"
+                \"due_on\": \"${DUE_ON}\",
+                \"custom_fields\": {
+                  \"1200038130204914\": \"1200603160957685\",
+                  \"1214780966676034\": \"1214780966676036\",
+                  \"1203895205998375\": \"1203895205998376\",
+                  \"1205371522841649\": \"${VERSION_FIELD}\"
+                }
               }
             }")
 
@@ -567,6 +575,8 @@ jobs:
           fi
 
           DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
+          VERSION_FIELD="${VERSION_FULL} (${VERSION_CODE})"   # Asana "Version" text field
+          # custom_fields GIDs → Department IG=QA, Type=Build, Platforms IG=iOS, Version(text)
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
             -H "Content-Type: application/json" \
@@ -576,7 +586,13 @@ jobs:
                 \"notes\": \"Branch: ${BRANCH}\n\nRelease Notes:\n${RELEASE_NOTES}\",
                 \"projects\": ${PROJECTS},
                 \"assignee\": \"${ASANA_ASSIGNEE_ID}\",
-                \"due_on\": \"${DUE_ON}\"
+                \"due_on\": \"${DUE_ON}\",
+                \"custom_fields\": {
+                  \"1200038130204914\": \"1200603160957685\",
+                  \"1214780966676034\": \"1214780966676036\",
+                  \"1203895205998375\": \"1203895205998378\",
+                  \"1205371522841649\": \"${VERSION_FIELD}\"
+                }
               }
             }")
 
