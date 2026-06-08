@@ -71,7 +71,7 @@ on:
         required: false
         default: true
       e2e_tests:
-        description: "Run the caller repo's Playwright e2e suite BEFORE the integration gate. A failing suite blocks the build (gate + build are skipped, nothing is spent). Self-skips (non-blocking) if the repo has no playwright config."
+        description: "Run the caller repo's Playwright e2e suite BEFORE the integration gate. A failing suite blocks the build (gate + build are skipped, nothing is spent). Self-skips (non-blocking) if the repo has no playwright config, or has a config but no 'e2e' npm script (logged as a warning)."
         type: boolean
         required: false
         default: true
@@ -281,9 +281,11 @@ jobs:
   # browser, so it runs `npm ci` + `npx playwright install chromium` itself
   # (kept out of the gate job, which runs on bare host Node by design).
   #
-  # The job ends GREEN when it self-skips — toggle off (e2e_tests=false) or the
-  # repo has no playwright config — so projects without an e2e suite are an
-  # instant no-op success and the gate still runs normally for them.
+  # The job ends GREEN when it self-skips — toggle off (e2e_tests=false), the
+  # repo has no playwright config, OR a config exists but there's no `e2e` npm
+  # script (logged as a ::warning:: — a half-wired suite must not block builds).
+  # So projects without a runnable e2e suite are an instant no-op success and
+  # the gate still runs normally for them.
   # ───────────────────────────────────────────────────────────
   e2e:
     name: E2E tests (Playwright)
@@ -302,12 +304,17 @@ jobs:
           if [ "$ENABLED" != "true" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "ℹ e2e_tests input is false — skipping e2e (non-blocking)."
-          elif ls playwright.config.* >/dev/null 2>&1; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-            echo "✓ playwright config found — running e2e suite."
-          else
+          elif ! ls playwright.config.* >/dev/null 2>&1; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "ℹ No playwright config in this repo — skipping e2e (non-blocking)."
+          elif [ -f package.json ] && jq -e '.scripts.e2e' package.json >/dev/null 2>&1; then
+            # Detect on the 'e2e' script too — that's what we actually run.
+            # A config alone is ambiguous (suite may live elsewhere / be half-wired).
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "✓ playwright config + 'e2e' npm script found — running e2e suite."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::playwright.config.* found but no 'e2e' npm script in package.json — skipping e2e (non-blocking). Add an 'e2e' script (e.g. \"playwright test\") to enable the suite."
           fi
 
       # Self-hosted: use the host's Node (already required by the build jobs).
