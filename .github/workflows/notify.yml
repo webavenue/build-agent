@@ -247,12 +247,14 @@ jobs:
           # Build the multi-line notes body separately, then hand it to jq as a
           # single value so we don't break YAML block-scalar indentation.
           NOTES=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+          DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
           PAYLOAD=$(jq -n \
             --arg name "$TASK_NAME" \
             --arg notes "$NOTES" \
             --argjson projects "$PROJECTS" \
             --arg assignee "$ASANA_ASSIGNEE_ID" \
-            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee}}')
+            --arg due_on "$DUE_ON" \
+            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee, due_on: $due_on}}')
 
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
@@ -304,12 +306,14 @@ jobs:
           fi
 
           NOTES=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+          DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
           PAYLOAD=$(jq -n \
             --arg name "$TASK_NAME" \
             --arg notes "$NOTES" \
             --argjson projects "$PROJECTS" \
             --arg assignee "$ASANA_ASSIGNEE_ID" \
-            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee}}')
+            --arg due_on "$DUE_ON" \
+            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee, due_on: $due_on}}')
 
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \

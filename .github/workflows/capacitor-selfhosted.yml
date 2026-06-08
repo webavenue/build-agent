@@ -1012,6 +1012,7 @@ jobs:
           echo "Creating Asana task: $TASK_NAME"
 
           NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+          DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
 
           REQUEST=$(jq -n \
             --arg name "$TASK_NAME" \
@@ -1019,12 +1020,14 @@ jobs:
             --arg qa_project "$ASANA_QA_PROJECT_ID" \
             --arg extra_project "$ASANA_PROJECT_ID" \
             --arg assignee "$ASANA_ASSIGNEE_ID" \
+            --arg due_on "$DUE_ON" \
             '{
               data: {
                 name: $name,
                 notes: $notes,
                 projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
-                assignee: $assignee
+                assignee: $assignee,
+                due_on: $due_on
               }
             }')
 
@@ -1074,6 +1077,7 @@ jobs:
           echo "Creating Asana task: $TASK_NAME"
 
           NOTES_BODY=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
+          DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
 
           REQUEST=$(jq -n \
             --arg name "$TASK_NAME" \
@@ -1081,12 +1085,14 @@ jobs:
             --arg qa_project "$ASANA_QA_PROJECT_ID" \
             --arg extra_project "$ASANA_PROJECT_ID" \
             --arg assignee "$ASANA_ASSIGNEE_ID" \
+            --arg due_on "$DUE_ON" \
             '{
               data: {
                 name: $name,
                 notes: $notes,
                 projects: (if $extra_project != "" then [$qa_project, $extra_project] else [$qa_project] end),
-                assignee: $assignee
+                assignee: $assignee,
+                due_on: $due_on
               }
             }')
 
