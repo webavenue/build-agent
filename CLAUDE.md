@@ -66,6 +66,8 @@ import_from_git(
 
 **Project-specific overrides** (e.g. extra `before_all` setup) can go in the caller Fastfile after the `import_from_git` call.
 
+**Crashlytics dSYMs (iOS):** `ship_auto` ends with a self-detecting Crashlytics dSYM upload — when the caller has the FirebaseCrashlytics pod (`ios/App/Pods/FirebaseCrashlytics/upload-symbols`) and `ios/App/App/GoogleService-Info.plist`, gym's dSYM zip is pushed via `upload_symbols_to_crashlytics`. No extra secrets (auth comes from the plist). Projects without Crashlytics skip silently; upload errors are warn-only and never fail the build (it runs after the TestFlight upload). This is separate from App Store Connect symbolication, which already works via the default `uploadSymbols` export option.
+
 **Future Unity:** Unity lanes will live in `fastlane/unity/Fastfile` (separate path, separate import) when set up. No interference with Capacitor lanes.
 
 ### Workflow inputs
@@ -132,6 +134,7 @@ DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
     - **iOS:** queries TestFlight for the max build number across all versions, +1. Env in: `IOS_BUNDLE_ID`, `APPLE_API_KEY_PATH`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `NEXT_BUILD_NUMBER_FILE`.
 
     If either lane is absent or fails, that platform's job silently falls back to `version_code_offset + run_number`. Resolved codes are exposed as `needs.android.outputs.version_code` and `needs.ios.outputs.version_code`, consumed by their respective Asana QA tasks, the Slack message (shows both when they diverge — `Version: 1.2.3 (Android 158 · iOS 42)`), and the `build-<N>` release tag (prefers Android, falls back to iOS).
+- **Play's "missing native debug symbols" warning is unactionable for Capacitor ad games.** Investigated for Dot Collector (June 2026): `debugSymbolLevel 'FULL'` + pinned `ndkVersion` are set, the NDK is on the runner, and `extractReleaseNativeDebugMetadata` runs — but it extracts 0 files because every `.so` in the app is a pre-stripped vendor binary (Pangle, AppLovin crash reporter, DataStore, zstd-jni). There's no first-party native code, so no symbols exist to bundle. The Android job's "Verify native debug symbols in AAB" step prints this diagnosis per build. Java/ANR stacks stay readable (minify off); vendor-native frames can only be symbolicated by the vendor.
 - **Notifications:** After both Android and iOS jobs finish, a notify job creates Asana QA tasks and posts a Slack message with build status, download links, and release notes. Notify runs on ubuntu-latest (no benefit to self-hosting it, and it frees the Mac mini for build jobs).
 - **Failure diagnosis:** On Android or iOS failure, the notify job pulls the failed-step logs via `gh run view --log-failed`, asks Claude Haiku 4.5 for a 2–4 sentence plain-English diagnosis, and posts it as a threaded reply to the Slack failure message. Requires `ANTHROPIC_API_KEY` on the caller repo; silently skipped if absent. Needs `actions: read` permission on the notify job (already declared).
 
