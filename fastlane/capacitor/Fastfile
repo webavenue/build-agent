@@ -300,10 +300,54 @@ platform :ios do
     )
   end
 
+  desc "Upload build dSYMs to Firebase Crashlytics (self-detecting — skips if the project doesn't use Crashlytics)"
+  private_lane :upload_dsyms_to_crashlytics do
+    project_path = ENV['CAPACITOR_PROJECT_PATH']
+    if project_path.nil? || project_path.empty?
+      UI.important("CAPACITOR_PROJECT_PATH not set — skipping Crashlytics dSYM upload.")
+      next
+    end
+
+    ios_app_dir   = File.expand_path(File.join(project_path, 'ios/App'))
+    upload_binary = File.join(ios_app_dir, 'Pods', 'FirebaseCrashlytics', 'upload-symbols')
+    gsp_path      = File.join(ios_app_dir, 'App', 'GoogleService-Info.plist')
+    dsym_zip      = lane_context[SharedValues::DSYM_OUTPUT_PATH]
+
+    # Self-detecting, like ensure_applovin_quality_service: only projects with
+    # the FirebaseCrashlytics pod have anywhere to send symbols. No extra
+    # secrets needed — upload-symbols authenticates via GoogleService-Info.plist.
+    if !File.exist?(upload_binary)
+      UI.message("FirebaseCrashlytics pod not installed — skipping dSYM upload.")
+      next
+    elsif !File.exist?(gsp_path)
+      UI.important("FirebaseCrashlytics pod present but no GoogleService-Info.plist at #{gsp_path} — skipping dSYM upload.")
+      next
+    elsif dsym_zip.nil? || !File.exist?(dsym_zip)
+      UI.important("gym produced no dSYM zip — skipping Crashlytics dSYM upload.")
+      next
+    end
+
+    # Best-effort by design: this runs AFTER the TestFlight upload, so a
+    # symbols hiccup must never fail a build that already shipped. Worst case
+    # one build lacks Crashlytics symbolication and the next one retries.
+    begin
+      upload_symbols_to_crashlytics(
+        dsym_path:           dsym_zip,
+        gsp_path:            gsp_path,
+        binary_path:         upload_binary,
+        dsym_worker_threads: 3,   # ~24 dSYMs per Capacitor build; serial upload adds 5+ min
+      )
+      UI.success("Crashlytics dSYM upload complete")
+    rescue => e
+      UI.important("Crashlytics dSYM upload failed (#{e.class}: #{e.message}) — build unaffected, continuing.")
+    end
+  end
+
   desc "Build + Upload to TestFlight using automatic signing (sigh + host keychain cert)"
   lane :ship_auto do
     build_auto
     upload
+    upload_dsyms_to_crashlytics   # after TestFlight upload — can never delay or block the ship
     notify_success("iOS")
   end
 
