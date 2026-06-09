@@ -186,16 +186,33 @@ Replace `<TOKEN>` and the repo URL.
 
 A **404 here** means the URL doesn't match the repo the token was generated for. Verify with `git remote -v` on a local checkout.
 
-### 6d. Set per-runner env vars (Android SDK path)
+### 6d. Set per-runner env vars (Android SDK path + UTF-8 locale)
 
-The runner reads a `.env` file at startup. Tell it where the Android SDK lives:
+The runner reads a `.env` file at startup. Tell it where the Android SDK lives,
+and force a UTF-8 locale:
 
 ```bash
 cat >> /Users/ava/actions-runners/<repo-shortname>/.env <<'EOF'
 ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
 EOF
 ```
+
+**Why the locale matters.** Under launchd the runner inherits no `LANG`, so
+Ruby's `Encoding.default_external` falls back to US-ASCII. Ruby 4.x made this
+fatal where older Rubies tolerated it: any tool that reads a UTF-8 file then
+parses or normalizes it breaks. Two we hit:
+- **fastlane** — `import_from_git` of the shared Fastfile dies with
+  `invalid multibyte character 0xE2` (the Fastfile has `→ ✓ ✅ … —`).
+- **CocoaPods** — `pod install` crashes in `String#unicode_normalize`
+  (`WARNING: CocoaPods requires your terminal to be using UTF-8 encoding`).
+
+The Capacitor workflow also sets `LANG`/`LC_ALL` at the build-job level as a
+belt-and-suspenders guard, but setting it here protects *every* workflow and
+any manual command run on the box. Restart the service after editing `.env`
+(`./svc.sh stop && ./svc.sh start`) — `.env` is read once at startup.
 
 ### 6e. Install as a launchd service
 
@@ -358,6 +375,14 @@ npm lifecycle scripts are being skipped. Run `npm config get ignore-scripts` on 
 npm config set ignore-scripts false   # verify: npm config get ignore-scripts → false
 ```
 The Capacitor workflows already pass `--ignore-scripts=false` on `npm ci`/`npm run build`, so this only bites manual `npm` runs or older workflow revisions — but keep the host config off regardless. See §1.
+
+### `invalid multibyte character 0xE2` (fastlane) or CocoaPods "requires UTF-8 encoding"
+The runner has no UTF-8 locale. Under launchd `LANG` is unset, so Ruby's `Encoding.default_external` is US-ASCII — fatal on Ruby 4.x. fastlane's `import_from_git` then dies parsing the shared Fastfile's multibyte chars (`0xE2`), and `pod install` crashes in `String#unicode_normalize`. Fix on the host (`.env`, §6d):
+```bash
+printf 'LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8\n' >> /Users/ava/actions-runners/<repo>/.env
+./svc.sh stop && ./svc.sh start   # .env is read once at startup
+```
+Confirm it took with `locale` (should report `en_US.UTF-8`, not `C`/`POSIX`). The build jobs in `capacitor-selfhosted.yml` also set these at job level, so an up-to-date workflow survives a locale-less host — but fixing the host protects every workflow and manual command on the box.
 
 ### iOS codesign fails with `errSecInternalComponent` on the first 1–2 frameworks
 Either the partition list wasn't set or the keychain unlock step is skipping. Verify:
