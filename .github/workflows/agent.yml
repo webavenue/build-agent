@@ -131,10 +131,8 @@ jobs:
           else
             AUTHNOTE="The requester is NOT authorized for rollout actions (read-only)."
           fi
-          PROMPT="Slack user ${REQUESTER} asks about project ${PROJECT}: ${QUESTION}
-
-${AUTHNOTE}
-Reply for Slack (concise, *bold* + bullets, no markdown tables/headers)."
+          NL=$'\n'
+          PROMPT="Slack user ${REQUESTER} asks about project ${PROJECT}: ${QUESTION}${NL}${NL}${AUTHNOTE}${NL}Reply for Slack (concise, *bold* + bullets, no markdown tables/headers)."
 
           codex exec \
             --skip-git-repo-check \
