@@ -13,6 +13,8 @@ Reusable GitHub Actions workflow repo for building and releasing **Capacitor** (
 .github/workflows/external-notify.yml       # Reusable: fetch Play/TestFlight versions, then delegate to notify.yml (externally-built projects)
 .github/workflows/claude-review.yml         # Reusable automated PR reviewer (Claude Code Action), tuned per project_type
 fastlane/capacitor/Fastfile                 # SHARED Capacitor Fastlane lanes, imported by caller repos via `import_from_git`
+.github/workflows/agent.yml                 # @Neo Slack agent — rollout/health Q&A + staged-rollout control (dispatched on THIS repo, Codex headless)
+agent-tools/                                # @Neo agent toolkit: AGENTS.md playbook, per-service scripts (bin/), per-game configs (projects/)
 slack-bot/                                  # Cloudflare Worker backing the Slack `/build` slash command (workflow_dispatch trigger)
 channel-map.json                            # Source-of-truth Slack channel_id → "owner/repo" map; pushed to the bot's CHANNEL_MAP secret
 docs/self-hosted-setup.md                   # Runbook for installing the Mac mini runner + Fastfile changes
@@ -158,6 +160,56 @@ A single Cloudflare Worker (`build-agent-slack-bot`) backing two slash commands.
 - **`GITHUB_TOKEN` permissions:** `/build` needs `actions: write`; `/invite-to-repo` also needs collaborator management — classic `repo` scope, or a fine-grained PAT with **Administration: read & write** — on every repo in `CHANNEL_MAP`. A token that's actions-only will surface a 403 in the Slack reply on invite.
 - **Worker config (`wrangler.toml`):** `WORKFLOW_FILE=build.yml`, `DEFAULT_REF=develop` — so the dispatched workflow must exist on `develop` (or pass a branch as the 3rd arg). Secrets set via `wrangler secret put`: `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `CHANNEL_MAP`.
 - **Deploy / debug:** `npm run deploy` (wrangler deploy), `npm run tail` for live logs. Healthcheck `GET /healthz`. All requests are HMAC-verified against `SLACK_SIGNING_SECRET` with 5-minute replay protection.
+
+## @Neo rollout & app-health agent (`agent.yml` + `agent-tools/`)
+
+@mention the **Neo** Slack app in a mapped game channel to ask rollout/health questions ("how is the game doing?", "any new crashes?", "why did ad revenue drop?") or — for allowlisted users — change a staged rollout ("increase rollout to 50%", "halt the rollout"). Runs **OpenAI Codex headless** (not Claude — uses the ChatGPT-subscription login cached on the runner host), driven by the playbook in `agent-tools/AGENTS.md`. Capacitor games only for now.
+
+### Flow
+
+```
+@Neo mention → worker POST /slack/events (HMAC verify, retry dedupe, 3s ack)
+            → workflow_dispatch agent.yml on webavenue/build-agent   ← canonical slug required for API calls
+            → runner "neo-agent" (label `agent`; Neo's MacBook, ~/actions-runners/neo-agent)
+            → codex exec in agent-tools/ (+ Firebase MCP server for Crashlytics)
+            → threaded Slack reply (chat.postMessage)
+```
+
+### Security model — the LLM is never the authorization boundary
+
+- **Who can mutate:** Slack user IDs in the worker secret `ROLLOUT_ALLOWLIST` (JSON array), re-checked inside agent.yml against the repo **variable** `ROLLOUT_ALLOWED_SLACK_IDS` (comma-separated). Both must agree.
+- **Credential gating:** write-capable keys (Play publisher JSON, ASC .p8) are written per-job from secrets and **deleted before Codex starts** when the requester isn't allowlisted — the mutating scripts fail closed no matter what the model tries. Read-only runs still see rollout status + ratings via a workflow **pre-fetch snapshot** embedded in the prompt.
+- **99% hard cap:** `play_rollout_update` refuses anything ≥99.5%, and there is **no complete-to-100% tool** for either platform (100% is manual in Play Console; iOS phased release auto-ramps per Apple's 7-day schedule).
+- All Slack-controlled text reaches shell via `env:` only — never `${{ }}` inside `run:` blocks — so a malicious question can't shell-inject.
+
+### Data sources (each validated live before being wired in)
+
+| Data | Source | Auth |
+|---|---|---|
+| Rollout state + control | Play `edits.tracks` / ASC phased release | `GOOGLE_PLAY_JSON_KEY_BASE64` / `APPLE_API_KEY_BASE64` (gated) |
+| Crash/ANR rates by versionCode | Play Developer Reporting API | `GOOGLE_PLAY_REPORTING_KEY_BASE64` |
+| Crash issues + stack traces (both platforms, 90d) | **Firebase MCP** (`firebase mcp --only crashlytics`) | `firebase login` on the runner host |
+| Users / engagement / revenue by appVersion | GA4 Data API | reporting SA is GA **account-level Viewer** |
+| Ratings | Play `reviews.list` (per-version, commented only) · iTunes lookup (public) · ASC `customerReviews` | publisher SA / none / `.p8` |
+| Ad monetization (eCPM, fill rate, per-network) | AppLovin MAX reporting API | `MAX_REPORTING_API_KEY` |
+
+### Secrets/variables — all on THIS repo, game repos need nothing
+
+Secrets: `GOOGLE_PLAY_JSON_KEY_BASE64`, `GOOGLE_PLAY_REPORTING_KEY_BASE64`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `SLACK_BOT_TOKEN`, `MAX_REPORTING_API_KEY` — push with `./scripts/push-secrets.sh webavenue/build-agent`. Variable: `ROLLOUT_ALLOWED_SLACK_IDS`. Worker secrets (`wrangler secret put`): `ROLLOUT_ALLOWLIST`, `SLACK_BOT_TOKEN`, `CHANNEL_MAP`.
+
+### Onboarding a game to the agent
+
+1. Create `agent-tools/projects/<name>.env` — `APP_NAME`, `ANDROID_PACKAGE_NAME`, `IOS_BUNDLE_ID`, `FIREBASE_PROJECT`, `FIREBASE_ANDROID_APP_ID` + `FIREBASE_IOS_APP_ID` (from `firebase apps:list`), `GA_PROPERTY_ID`, `CRASHLYTICS_TABLE_PREFIX`.
+2. In `channel-map.json`, change the channel's entry from `"owner/repo"` to `{"repo":"owner/repo","project":"<name>"}`, then `cd slack-bot && npx wrangler secret put CHANNEL_MAP < ../channel-map.json`.
+3. Nothing in the game repo. No new secrets anywhere.
+
+### Gotchas (these cost real time)
+
+- **Version namespaces differ per service** for the same game (Energy: Play `8.11.5` vs ASC `9.9.3` vs GA `9.99`; Crashlytics mixes old `1.0.x` builds in). Correlate by release date, never string-match — encoded as rule 1 in `agent-tools/AGENTS.md`.
+- **Unindented lines inside a YAML `run: |` block** silently terminate the block scalar; GitHub still registers the workflow but `workflow_dispatch` fails with a misleading 422 "Workflow does not have 'workflow_dispatch' trigger". Parse with `ruby -ryaml` before pushing.
+- **The firebase CLI has no Crashlytics read commands** (upload-only) — the MCP server is the only CLI-adjacent read path. The BigQuery export (`bin/crashlytics_top`) is an optional fallback for custom SQL.
+- **Play `reviews.list`** returns only commented reviews (~last 7 days, skews negative — fine for build-vs-build, never comparable to the store average). **Apple ratings are cumulative** — no per-version ratings exist.
+- **Runner host one-time setup:** `codex login` (ChatGPT auth), `gcloud auth login` (for bq), `gem install jwt`, google-cloud-sdk. See the "Agent runner" section in docs/self-hosted-setup.md. bq/gcloud also need codex sandbox write carve-outs — already configured in agent.yml.
 
 ## Automated PR review (claude-review.yml)
 
