@@ -39,6 +39,8 @@ source ./projects/$PROJECT.env
 
 4. **Be precise about staleness**: vitals lag ~2 days, GA ends "yesterday", Crashlytics REALTIME is near-live. State the data window in your answer.
 
+**Pre-fetched store status.** The workflow pre-fetches `play_rollout_status` + `ios_phased_status` output and includes it in your prompt. If running those scripts fails (read-only runs don't have the store credentials), use the pre-fetched block — it is fresh, fetched seconds before you started. Never report rollout status as "unavailable" when the prompt contains it.
+
 ## Health report recipe
 
 When asked for a health report (or before recommending a rollout increase):

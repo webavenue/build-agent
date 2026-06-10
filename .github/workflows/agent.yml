@@ -97,20 +97,43 @@ jobs:
           echo "can_rollout=$can" >> "$GITHUB_OUTPUT"
           echo "rollout authorization: $can"
 
-      - name: Write credentials (write keys only when authorized)
+      - name: Write credentials
         env:
           REPORTING_B64: ${{ secrets.GOOGLE_PLAY_REPORTING_KEY_BASE64 }}
           PLAY_B64: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}
           ASC_B64: ${{ secrets.APPLE_API_KEY_BASE64 }}
-          CAN_ROLLOUT: ${{ steps.auth.outputs.can_rollout }}
         run: |
           KEYDIR="$RUNNER_TEMP/agent-keys"
           mkdir -p "$KEYDIR" && chmod 700 "$KEYDIR"
           printf '%s' "$REPORTING_B64" | base64 -d > "$KEYDIR/play-reporting.json"
-          if [ "$CAN_ROLLOUT" = "true" ]; then
-            printf '%s' "$PLAY_B64" | base64 -d > "$KEYDIR/play-key.json"
-            printf '%s' "$ASC_B64"  | base64 -d > "$KEYDIR/asc.p8"
-          fi
+          printf '%s' "$PLAY_B64" | base64 -d > "$KEYDIR/play-key.json"
+          printf '%s' "$ASC_B64"  | base64 -d > "$KEYDIR/asc.p8"
+
+      # Read-only users still get rollout/phased status: the WORKFLOW fetches it
+      # while the store keys are on disk, hands Codex only the OUTPUT, and then
+      # (next step) removes the keys before Codex ever runs.
+      - name: Pre-fetch store status snapshot
+        working-directory: agent-tools
+        env:
+          PROJECT: ${{ inputs.project }}
+          AGENT_PLAY_KEY: ${{ runner.temp }}/agent-keys/play-key.json
+          AGENT_ASC_KEY: ${{ runner.temp }}/agent-keys/asc.p8
+          AGENT_ASC_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          AGENT_ASC_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          source "./projects/$PROJECT.env"
+          {
+            echo "== Google Play production track =="
+            bin/play_rollout_status "$ANDROID_PACKAGE_NAME" || echo "(Play status unavailable)"
+            echo ""
+            echo "== App Store versions / phased release =="
+            bin/ios_phased_status "$IOS_BUNDLE_ID" || echo "(App Store status unavailable)"
+          } > "$RUNNER_TEMP/store-status.txt" 2>&1 || true
+          cat "$RUNNER_TEMP/store-status.txt"
+
+      - name: Drop write credentials when not authorized
+        if: steps.auth.outputs.can_rollout != 'true'
+        run: rm -f "$RUNNER_TEMP/agent-keys/play-key.json" "$RUNNER_TEMP/agent-keys/asc.p8"
 
       - name: Run Codex agent
         working-directory: agent-tools
@@ -132,7 +155,8 @@ jobs:
             AUTHNOTE="The requester is NOT authorized for rollout actions (read-only)."
           fi
           NL=$'\n'
-          PROMPT="Slack user ${REQUESTER} asks about project ${PROJECT}: ${QUESTION}${NL}${NL}${AUTHNOTE}${NL}Reply for Slack (concise, *bold* + bullets, no markdown tables/headers)."
+          SNAPSHOT="$(cat "$RUNNER_TEMP/store-status.txt" 2>/dev/null || true)"
+          PROMPT="Slack user ${REQUESTER} asks about project ${PROJECT}: ${QUESTION}${NL}${NL}${AUTHNOTE}${NL}Reply for Slack (concise, *bold* + bullets, no markdown tables/headers).${NL}${NL}Pre-fetched store status (fresh, use instead of play_rollout_status/ios_phased_status if those scripts fail):${NL}${SNAPSHOT}"
 
           codex exec \
             --skip-git-repo-check \
