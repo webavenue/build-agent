@@ -25,13 +25,13 @@ source ./projects/$PROJECT.env
 | Android production rollout state | `bin/play_rollout_status $ANDROID_PACKAGE_NAME` | status `inProgress` + rollout % = staged rollout; `completed` = 100% |
 | Android crash % / ANR % by versionCode | `bin/play_vitals $ANDROID_PACKAGE_NAME` | 28d user-weighted; data lags ~2 days; Play grades apps bad at ≥1.09% user-perceived crash, ≥0.47% user-perceived ANR |
 | iOS App Store versions + phased release | `bin/ios_phased_status $IOS_BUNDLE_ID` | phased release auto-ramps over 7 days; `READY_FOR_SALE` = live |
-| Crash details / new top issues (Android & iOS) | `bin/crashlytics_top $FIREBASE_PROJECT $CRASHLYTICS_TABLE_PREFIX ANDROID\|IOS [days]` | BigQuery export; 30-day retention; may be unavailable on some projects — if it errors, say so and continue with other sources |
+| Crash details / new top issues (Android & iOS) | **Crashlytics MCP tools** (preferred): `crashlytics_get_report` with `report: "topIssues"`, `appId: $FIREBASE_ANDROID_APP_ID` or `$FIREBASE_IOS_APP_ID`, filter `issueErrorTypes: ["FATAL"]` (or `["ANR"]` on Android). Drill down with `crashlytics_get_issue` / `crashlytics_list_events`. | Same data the Firebase console shows, up to 90 days. Fallback: `bin/crashlytics_top $FIREBASE_PROJECT $CRASHLYTICS_TABLE_PREFIX ANDROID\|IOS [days]` (BigQuery export — only on projects with the export enabled) |
 | Users / engagement / revenue / ad revenue by appVersion | `bin/ga_health $GA_PROPERTY_ID [days]` | GA4; "yesterday" is the freshest complete day |
 
 ## Critical rules
 
 1. **Version namespaces differ per service — never match version strings across services.**
-   Play `versionName` (e.g. `1.1.0`), App Store `versionString` (e.g. `9.9.3`), and GA/Crashlytics `appVersion` (e.g. `9.99`) are independent numbering schemes. Compare versions only WITHIN one service. To correlate across services, use release dates and "latest vs previous", never string equality.
+   Play `versionName` (e.g. `1.1.0`), App Store `versionString` (e.g. `9.9.3`), GA `appVersion` (e.g. `9.99`), and Crashlytics `displayName`/`firstSeenVersion` can ALL be independent numbering schemes for the same game. Compare versions only WITHIN one service. To correlate across services, use release dates and "latest vs previous", never string equality.
 
 2. **Normalize per-user before comparing versions in GA.** A version mid-rollout has fewer users; raw totals mislead. Compare engagement-seconds-per-user, revenue-per-user (shown by `ga_health`), not totals. Flag small samples (<100 users) as low-confidence.
 

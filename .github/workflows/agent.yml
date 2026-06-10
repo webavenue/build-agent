@@ -163,6 +163,9 @@ jobs:
             --sandbox workspace-write \
             -c sandbox_workspace_write.network_access=true \
             -c "sandbox_workspace_write.writable_roots=[\"$HOME/.config/gcloud\",\"$HOME/.bigquery\",\"$HOME/.bigqueryrc\",\"$HOME/.cache\"]" \
+            -c 'mcp_servers.firebase.command="firebase"' \
+            -c 'mcp_servers.firebase.args=["mcp","--only","crashlytics"]' \
+            -c 'mcp_servers.firebase.startup_timeout_sec=30' \
             --output-last-message "$RUNNER_TEMP/answer.md" \
             "$PROMPT"
 
