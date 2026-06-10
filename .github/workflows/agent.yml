@@ -154,6 +154,7 @@ jobs:
           AGENT_ASC_KEY: ${{ runner.temp }}/agent-keys/asc.p8
           AGENT_ASC_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           AGENT_ASC_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          AGENT_MAX_API_KEY: ${{ secrets.MAX_REPORTING_API_KEY }}
         run: |
           if [ "$CAN_ROLLOUT" = "true" ]; then
             AUTHNOTE="The requester IS authorized for rollout actions."

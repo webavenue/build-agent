@@ -29,6 +29,7 @@ source ./projects/$PROJECT.env
 | Users / engagement / revenue / ad revenue by appVersion | `bin/ga_health $GA_PROPERTY_ID [days]` | GA4; "yesterday" is the freshest complete day |
 | Play ratings by version (recent) | `bin/play_ratings $ANDROID_PACKAGE_NAME` | Commented reviews only (~last 7 days) — skews negative; valid for build-vs-build deltas, NOT comparable to the store-listing average |
 | App Store ratings | `bin/ios_ratings $IOS_BUNDLE_ID [countries]` | All-time average per storefront + recent-50-review trend. Apple has NO per-version ratings (cumulative only) — never claim an iOS build changed the rating; report trend instead |
+| Ad monetization: daily revenue/eCPM + per-network breakdown (fill rate, share) | `bin/max_ads $ANDROID_PACKAGE_NAME android [days]` / `bin/max_ads $IOS_BUNDLE_ID ios [days]` | AppLovin MAX reporting. Use this to explain WHY ad revenue moved (network eCPM drop, fill drop). MAX "estimated_revenue" and GA "totalAdRevenue" are differently-sourced estimates — small gaps are normal, compare trends not absolutes |
 
 ## Critical rules
 
@@ -53,6 +54,7 @@ When asked for a health report (or before recommending a rollout increase):
 4. `bin/ga_health` — latest vs previous appVersion, per-user normalized.
 5. `bin/ios_phased_status` — iOS version + phased state.
 6. `bin/play_ratings` + `bin/ios_ratings` — user sentiment: Android build-vs-build review average, iOS all-time + recent trend.
+7. If ad revenue moved (or the question is monetization-related): `bin/max_ads` per platform — check whether it's volume (impressions), pricing (eCPM), or a specific network's fill.
 
 Summarize for Slack: short, plain English, lead with the verdict (healthy / watch / problem), then the numbers. Use Slack formatting (*bold*, bullet lines), not markdown headers or tables.
 

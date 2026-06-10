@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# AppLovin MAX ad monetization report: daily revenue/eCPM + network breakdown.
+# Usage: max_ads <package-or-bundle> <android|ios> [days=7]
+# Env: AGENT_MAX_API_KEY (MAX *reporting* key; falls back to MAX_REPORTING_API_KEY
+#      in the repo-root .secrets.env for local use)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PKG="${1:?usage: max_ads <package-or-bundle> <android|ios> [days]}"
+PLATFORM="${2:?platform required: android or ios}"
+DAYS="${3:-7}"
+
+KEY="${AGENT_MAX_API_KEY:-}"
+if [ -z "$KEY" ] && [ -f "$HERE/../.secrets.env" ]; then
+  KEY="$(grep -m1 '^MAX_REPORTING_API_KEY=' "$HERE/../.secrets.env" | cut -d= -f2- | tr -d '"')"
+fi
+[ -n "$KEY" ] || { echo "max_ads: no MAX reporting key available (AGENT_MAX_API_KEY)" >&2; exit 2; }
+
+START=$(date -v-"$DAYS"d +%Y-%m-%d 2>/dev/null || date -d "-$DAYS days" +%Y-%m-%d)
+END=$(date -v-1d +%Y-%m-%d 2>/dev/null || date -d "-1 day" +%Y-%m-%d)
+
+RESP_FILE="$(mktemp /tmp/max_ads.XXXXXX)"
+trap 'rm -f "$RESP_FILE"' EXIT
+curl -s -G "https://r.applovin.com/maxReport" \
+  --data-urlencode "api_key=$KEY" \
+  --data-urlencode "start=$START" --data-urlencode "end=$END" \
+  --data-urlencode "columns=day,network,estimated_revenue,impressions,ecpm,attempts,responses" \
+  --data-urlencode "filter_package_name=$PKG" \
+  --data-urlencode "filter_platform=$PLATFORM" \
+  --data-urlencode "format=json" -o "$RESP_FILE"
+
+RESP_FILE="$RESP_FILE" PKG="$PKG" PLATFORM="$PLATFORM" python3 <<'PY'
+import json, os, sys
+from collections import defaultdict
+
+with open(os.environ["RESP_FILE"]) as fh:
+    d = json.load(fh)
+if "results" not in d:
+    sys.exit("max_ads API error: " + json.dumps(d)[:300])
+rows = d["results"]
+if not rows:
+    sys.exit(f"no MAX data for {os.environ['PKG']} ({os.environ['PLATFORM']}) in window")
+
+def f(x):
+    try: return float(x)
+    except (TypeError, ValueError): return 0.0
+
+days = defaultdict(lambda: [0.0, 0.0])           # day -> [revenue, impressions]
+nets = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0]) # network -> [rev, imp, attempts, responses]
+for r in rows:
+    days[r["day"]][0] += f(r.get("estimated_revenue"))
+    days[r["day"]][1] += f(r.get("impressions"))
+    n = nets[r.get("network", "?")]
+    n[0] += f(r.get("estimated_revenue")); n[1] += f(r.get("impressions"))
+    n[2] += f(r.get("attempts"));          n[3] += f(r.get("responses"))
+
+print(f"{os.environ['PKG']} ({os.environ['PLATFORM']}) — MAX ad monetization:")
+print("  daily:")
+for day in sorted(days):
+    rev, imp = days[day]
+    ecpm = rev / imp * 1000 if imp else 0
+    print(f"    {day}: ${rev:,.2f} rev, {int(imp):,} imps, eCPM ${ecpm:.2f}")
+
+total_rev = sum(v[0] for v in nets.values())
+print(f"  networks (window total ${total_rev:,.2f}):")
+for net, (rev, imp, att, resp) in sorted(nets.items(), key=lambda kv: -kv[1][0])[:8]:
+    ecpm = rev / imp * 1000 if imp else 0
+    fill = resp / att * 100 if att else 0
+    share = rev / total_rev * 100 if total_rev else 0
+    print(f"    {net}: ${rev:,.2f} ({share:.0f}%), eCPM ${ecpm:.2f}, fill {fill:.0f}%")
+PY
