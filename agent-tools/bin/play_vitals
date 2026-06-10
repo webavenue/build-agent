@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Android crash & ANR rates (28d user-weighted) by versionCode from the Play Developer Reporting API.
+# Usage: play_vitals <android-package> [top_n=8]
+# Env: AGENT_PLAY_REPORTING_KEY (default ~/Documents/Sensitive/google-play-reporting-api.json)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PKG="${1:?usage: play_vitals <android-package> [top_n]}"
+TOP="${2:-8}"
+KEY="${AGENT_PLAY_REPORTING_KEY:-$HOME/Documents/Sensitive/google-play-reporting-api.json}"
+
+TOKEN="$("$HERE/lib/gtoken.sh" "$KEY" https://www.googleapis.com/auth/playdeveloperreporting)"
+
+TOKEN="$TOKEN" PKG="$PKG" TOP="$TOP" python3 <<'PY'
+import json, os, sys, urllib.request, urllib.error
+from datetime import date, timedelta
+
+tok, pkg, top = os.environ["TOKEN"], os.environ["PKG"], int(os.environ["TOP"])
+base = f"https://playdeveloperreporting.googleapis.com/v1beta1/apps/{pkg}"
+
+# Vitals data lags ~2 days; query a 3-day window and keep the latest day per version.
+end = date.today() - timedelta(days=2)
+start = end - timedelta(days=2)
+
+def q(metric_set, metrics):
+    body = json.dumps({
+        "timelineSpec": {
+            "aggregationPeriod": "DAILY",
+            "startTime": {"year": start.year, "month": start.month, "day": start.day},
+            "endTime": {"year": end.year, "month": end.month, "day": end.day},
+        },
+        "dimensions": ["versionCode"], "metrics": metrics, "pageSize": 1000,
+    }).encode()
+    req = urllib.request.Request(f"{base}/{metric_set}:query", data=body,
+        headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    try:
+        return json.load(urllib.request.urlopen(req)).get("rows", [])
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code} {metric_set}:query\n{e.read().decode()[:400]}")
+
+def latest_by_version(rows):
+    out = {}
+    for row in rows:
+        vc = row["dimensions"][0]["stringValue"]
+        st = row["startTime"]; key = (st["year"], st["month"], st["day"])
+        mv = {m["metric"]: float(m["decimalValue"]["value"]) for m in row["metrics"]}
+        if vc not in out or key > out[vc][0]:
+            out[vc] = (key, mv)
+    return {k: v[1] for k, v in out.items()}
+
+crash = latest_by_version(q("crashRateMetricSet",
+    ["crashRate28dUserWeighted", "userPerceivedCrashRate28dUserWeighted", "distinctUsers"]))
+anr = latest_by_version(q("anrRateMetricSet",
+    ["anrRate28dUserWeighted", "userPerceivedAnrRate28dUserWeighted", "distinctUsers"]))
+
+if not crash:
+    sys.exit(f"{pkg}: no vitals rows (app too small for vitals, or SA lacks access)")
+
+vers = sorted(crash, key=lambda v: -crash[v].get("distinctUsers", 0))[:top]
+print(f"{pkg} — 28d user-weighted rates, latest day ({end})")
+print(f"{'verCode':>9}{'users':>8}{'crash%':>9}{'upCrash%':>10}{'anr%':>8}{'upAnr%':>8}")
+for v in vers:
+    c, a = crash.get(v, {}), anr.get(v, {})
+    print(f"{v:>9}{int(c.get('distinctUsers', 0)):>8}"
+          f"{c.get('crashRate28dUserWeighted', 0)*100:>9.3f}"
+          f"{c.get('userPerceivedCrashRate28dUserWeighted', 0)*100:>10.3f}"
+          f"{a.get('anrRate28dUserWeighted', 0)*100:>8.3f}"
+          f"{a.get('userPerceivedAnrRate28dUserWeighted', 0)*100:>8.3f}")
+PY

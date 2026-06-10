@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────
-// Slack slash commands → GitHub, backed by the shared CHANNEL_MAP.
+// Slack slash commands + @mentions → GitHub, backed by the shared CHANNEL_MAP.
 //
 //   /build  <android|ios|both> <version>   → workflow_dispatch
 //     Endpoint: POST /slack/build
@@ -7,9 +7,14 @@
 //   /invite-to-repo <github-username>      → repo collaborator invite
 //     Endpoint: POST /slack/invite
 //
-// Both resolve the target repo from the channel the command was run
-// in. Channel-to-repo mapping lives in the CHANNEL_MAP secret as
-// JSON, e.g. { "C0123456789": "webavenue/flight-manager", ... }
+//   @Neo <rollout/health question>         → agent.yml on AGENT_REPO
+//     Endpoint: POST /slack/events  (Events API, app_mention)
+//
+// All resolve the target from the channel via CHANNEL_MAP. Entries are
+// either "owner/repo" strings (slash commands only) or objects
+// { "repo": "owner/repo", "project": "idle-flight-manager" } — the
+// `project` key enables the rollout/health agent for that channel and
+// names a config in build-agent's agent-tools/projects/.
 // The channel ID is the Slack-internal ID, not the channel name.
 // ─────────────────────────────────────────────────────────────
 
@@ -19,10 +24,31 @@ export interface Env {
   CHANNEL_MAP: string;
   WORKFLOW_FILE: string;
   DEFAULT_REF: string;
+  // Rollout/health agent (@mentions → agent.yml dispatched on AGENT_REPO)
+  AGENT_REPO: string;
+  AGENT_WORKFLOW_FILE: string;
+  AGENT_REF: string;
+  ROLLOUT_ALLOWLIST?: string; // JSON array of Slack user IDs allowed to run rollout mutations
+  SLACK_BOT_TOKEN?: string;   // xoxb token for ack reactions + error replies (optional but recommended)
+}
+
+type ChannelEntry = { repo: string; project?: string };
+
+function resolveChannel(map: Record<string, unknown>, channelId: string): ChannelEntry | null {
+  const v = map[channelId];
+  if (typeof v === "string") return { repo: v };
+  if (v && typeof v === "object" && typeof (v as ChannelEntry).repo === "string") {
+    return v as ChannelEntry;
+  }
+  return null;
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(
+    req: Request,
+    env: Env,
+    ctx: { waitUntil(p: Promise<unknown>): void },
+  ): Promise<Response> {
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/healthz") {
@@ -31,7 +57,8 @@ export default {
 
     const isBuild = req.method === "POST" && url.pathname === "/slack/build";
     const isInvite = req.method === "POST" && url.pathname === "/slack/invite";
-    if (!isBuild && !isInvite) {
+    const isEvents = req.method === "POST" && url.pathname === "/slack/events";
+    if (!isBuild && !isInvite && !isEvents) {
       return new Response("Not found", { status: 404 });
     }
 
@@ -41,26 +68,32 @@ export default {
       return new Response("Invalid signature", { status: 401 });
     }
 
+    // ── @Neo mentions (Events API, JSON body) ──────────────────────
+    if (isEvents) {
+      return handleEvents(req, raw, env, ctx);
+    }
+
     const params = new URLSearchParams(raw);
     const channelId = params.get("channel_id") ?? "";
     const userId = params.get("user_id") ?? "";
     const text = (params.get("text") ?? "").trim();
 
     // Both commands need the channel → repo mapping, so resolve it up front.
-    let channelMap: Record<string, string>;
+    let channelMap: Record<string, unknown>;
     try {
       channelMap = JSON.parse(env.CHANNEL_MAP || "{}");
     } catch {
       return slackReply(":x: CHANNEL_MAP is not valid JSON. Ask an admin to fix the bot config.", "ephemeral");
     }
 
-    const repo = channelMap[channelId];
-    if (!repo) {
+    const entry = resolveChannel(channelMap, channelId);
+    if (!entry) {
       return slackReply(
         `:x: This channel (\`${channelId}\`) isn't mapped to a repo. Ask an admin to add it to CHANNEL_MAP.`,
         "ephemeral",
       );
     }
+    const repo = entry.repo;
 
     // ── /invite-to-repo <github-username> ──────────────────────────
     if (isInvite) {
@@ -357,4 +390,150 @@ function slackReply(text: string, responseType: "in_channel" | "ephemeral"): Res
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+// ─────────────────────────────────────────────────────────────
+// @Neo mentions → rollout/health agent
+//
+// Slack Events API delivery. Must 200 within 3 seconds, so the
+// GitHub dispatch happens in ctx.waitUntil after an immediate ack.
+// Authorization model: ROLLOUT_ALLOWLIST (JSON array of Slack user
+// IDs) decides `can_rollout`. The agent workflow withholds write
+// credentials when can_rollout=false — anyone in a mapped channel
+// can ask read-only health questions, only allowlisted users can
+// mutate rollouts. The allowlist check lives HERE (deterministic),
+// never in the LLM.
+// ─────────────────────────────────────────────────────────────
+
+function handleEvents(
+  req: Request,
+  raw: string,
+  env: Env,
+  ctx: { waitUntil(p: Promise<unknown>): void },
+): Response {
+  let payload: any;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return new Response("bad json", { status: 400 });
+  }
+
+  // One-time URL verification when the endpoint is registered in the Slack app config.
+  if (payload.type === "url_verification") {
+    return new Response(payload.challenge ?? "", {
+      status: 200,
+      headers: { "Content-Type": "text/plain" },
+    });
+  }
+
+  // Slack retries delivery if our ack was slow; the original is already being
+  // processed, so swallow retries instead of double-dispatching the agent.
+  if (req.headers.get("x-slack-retry-num")) {
+    return new Response("ok", { status: 200 });
+  }
+
+  const ev = payload.event;
+  const isMention =
+    payload.type === "event_callback" && ev && ev.type === "app_mention" && !ev.bot_id;
+  if (!isMention) {
+    return new Response("ignored", { status: 200 });
+  }
+
+  ctx.waitUntil(processMention(ev, env));
+  return new Response("ok", { status: 200 });
+}
+
+async function processMention(ev: any, env: Env): Promise<void> {
+  const channel = String(ev.channel ?? "");
+  const user = String(ev.user ?? "");
+  // Reply in the mention's thread; if the mention was already inside a thread, stay there.
+  const threadTs = String(ev.thread_ts ?? ev.ts ?? "");
+  const question = String(ev.text ?? "")
+    .replace(/<@[A-Z0-9]+>/g, "") // strip the @Neo mention itself
+    .trim()
+    .slice(0, 1500);
+
+  const reply = (text: string) =>
+    slackApi(env.SLACK_BOT_TOKEN, "chat.postMessage", { channel, thread_ts: threadTs, text });
+
+  let channelMap: Record<string, unknown>;
+  try {
+    channelMap = JSON.parse(env.CHANNEL_MAP || "{}");
+  } catch {
+    await reply(":x: CHANNEL_MAP is not valid JSON. Ask an admin to fix the bot config.");
+    return;
+  }
+
+  const entry = resolveChannel(channelMap, channel);
+  if (!entry?.project) {
+    await reply(
+      ":x: The rollout/health agent isn't enabled for this channel — its CHANNEL_MAP entry has no `project`. Ask an admin to add it.",
+    );
+    return;
+  }
+
+  if (!question) {
+    await reply(
+      `:wave: Ask me about *${entry.project}* — rollout status, crashes/ANRs, vitals, usage or revenue. Authorized users can also change the staged rollout (e.g. "increase rollout to 50%").`,
+    );
+    return;
+  }
+
+  let allowlist: string[] = [];
+  try {
+    const parsed = JSON.parse(env.ROLLOUT_ALLOWLIST || "[]");
+    if (Array.isArray(parsed)) allowlist = parsed.map(String);
+  } catch {
+    // Malformed allowlist ⇒ nobody can mutate. Fail closed.
+  }
+  const canRollout = allowlist.includes(user);
+
+  // Best-effort 👀 ack so the requester knows the agent picked it up.
+  await slackApi(env.SLACK_BOT_TOKEN, "reactions.add", {
+    channel,
+    timestamp: ev.ts,
+    name: "eyes",
+  });
+
+  const dispatch = await dispatchWorkflow(
+    env.AGENT_REPO,
+    env.AGENT_WORKFLOW_FILE,
+    env.AGENT_REF,
+    {
+      project: entry.project,
+      question,
+      slack_user_id: user,
+      slack_channel_id: channel,
+      slack_thread_ts: threadTs,
+      can_rollout: String(canRollout),
+    },
+    env.GITHUB_TOKEN,
+  );
+
+  if (!dispatch.ok) {
+    await reply(
+      `:x: Couldn't start the agent (GitHub dispatch HTTP ${dispatch.status}).\n\`\`\`${dispatch.body.slice(0, 300)}\`\`\``,
+    );
+  }
+}
+
+// Best-effort Slack Web API call; no-op when SLACK_BOT_TOKEN isn't configured.
+async function slackApi(
+  token: string | undefined,
+  method: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  if (!token) return;
+  try {
+    await fetch(`https://slack.com/api/${method}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    // ack/error replies are best-effort; the dispatch result is what matters
+  }
 }

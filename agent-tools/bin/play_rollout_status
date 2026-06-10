@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Show the current Google Play PRODUCTION track state for a package.
+# Usage: play_rollout_status <android-package>
+# Env: AGENT_PLAY_KEY (publisher service-account JSON; default ~/Documents/Sensitive/google-play-key.json)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PKG="${1:?usage: play_rollout_status <android-package>}"
+KEY="${AGENT_PLAY_KEY:-$HOME/Documents/Sensitive/google-play-key.json}"
+
+TOKEN="$("$HERE/lib/gtoken.sh" "$KEY" https://www.googleapis.com/auth/androidpublisher)"
+
+TOKEN="$TOKEN" PKG="$PKG" python3 <<'PY'
+import json, os, urllib.request, urllib.error, sys
+
+tok, pkg = os.environ["TOKEN"], os.environ["PKG"]
+base = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}"
+H = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
+
+def call(method, url, data=None):
+    req = urllib.request.Request(url, data=(json.dumps(data).encode() if data else None), headers=H, method=method)
+    try:
+        body = urllib.request.urlopen(req).read().decode()
+        return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code} {method} {url}\n{e.read().decode()[:400]}")
+
+eid = call("POST", base + "/edits")["id"]
+try:
+    trk = call("GET", f"{base}/edits/{eid}/tracks/production")
+    rels = trk.get("releases", [])
+    if not rels:
+        print(f"{pkg}: production track has no releases")
+    for r in rels:
+        frac = r.get("userFraction")
+        frac_s = f"{float(frac)*100:.0f}%" if frac is not None else "100%"
+        print(f"{pkg} production: status={r.get('status')} rollout={frac_s} "
+              f"versionCodes={','.join(r.get('versionCodes', []))} name={r.get('name')!r}")
+finally:
+    call("DELETE", f"{base}/edits/{eid}")
+PY

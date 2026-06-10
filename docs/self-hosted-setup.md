@@ -419,3 +419,41 @@ sudo ./svc.sh stop
 # Download new tarball, extract over existing files
 sudo ./svc.sh start
 ```
+
+## Agent runner (@Neo rollout/health agent)
+
+A dedicated runner instance registered to **webavenue/build-agent** with the extra label `agent`. It exists so `agent.yml` (dispatched by the Slack worker on @Neo mentions) never queues behind 30–60 min build jobs — agent jobs are lightweight (no Xcode/Gradle).
+
+**Current install:** `neo-agent` in `~/actions-runners/neo-agent` on Neo's MacBook (which already has codex/gcloud/bq/ruby logged in and configured). The recipe below works on any Mac host.
+
+One-time host prerequisites (as the runner user):
+
+```bash
+brew install google-cloud-sdk          # gcloud + bq (Play token mint, Crashlytics BigQuery)
+npm i -g @openai/codex                 # Codex CLI
+/opt/homebrew/opt/ruby/bin/gem install jwt   # ES256 for App Store Connect API
+
+codex login          # browser — ChatGPT account (auth persists in ~/.codex/auth.json)
+gcloud auth login    # browser — k@infinitygames.io (used by bq for Crashlytics export)
+```
+
+Runner install (registration token from GitHub → build-agent repo → Settings → Actions → Runners → "New self-hosted runner"):
+
+```bash
+mkdir -p ~/actions-runners/neo-agent && cd ~/actions-runners/neo-agent
+curl -o runner.tar.gz -L https://github.com/actions/runner/releases/download/v2.334.0/actions-runner-osx-arm64-2.334.0.tar.gz
+tar xzf runner.tar.gz && rm runner.tar.gz
+./config.sh --url https://github.com/webavenue/build-agent \
+  --token <REGISTRATION_TOKEN> \
+  --name neo-agent \
+  --labels agent \
+  --unattended
+# Homebrew + Homebrew-ruby on PATH for agent jobs (gcloud, bq, codex, ruby/jwt):
+echo 'PATH=/opt/homebrew/opt/ruby/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' > .path
+./svc.sh install && ./svc.sh start
+```
+
+Gotchas:
+- `agent.yml` targets `runs-on: [self-hosted, macOS, ARM64, agent]` — only this instance has the `agent` label, and build workflows don't request it, so the two runner pools never steal each other's jobs.
+- The two browser logins are the only interactive steps; both persist and self-refresh.
+- Write credentials (Play publisher key, ASC .p8) are NOT on this host — `agent.yml` injects them per-job from repo secrets, and only when the requester passed the rollout allowlist.

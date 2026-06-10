@@ -11,7 +11,7 @@ Reusable GitHub Actions workflow repo for building and releasing **Capacitor** (
 .github/workflows/unity-selfhosted.yml      # Reusable workflow for Unity projects (self-hosted Mac mini)
 .github/workflows/notify.yml                # Reusable changelog + Asana + Slack + build/* tag (called by unity-selfhosted & external-notify)
 .github/workflows/external-notify.yml       # Reusable: fetch Play/TestFlight versions, then delegate to notify.yml (externally-built projects)
-.github/workflows/claude-review.yml         # Reusable automated PR reviewer (Claude Code Action), tuned per project_type
+.github/workflows/Codex-review.yml         # Reusable automated PR reviewer (Codex Action), tuned per project_type
 fastlane/capacitor/Fastfile                 # SHARED Capacitor Fastlane lanes, imported by caller repos via `import_from_git`
 slack-bot/                                  # Cloudflare Worker backing the Slack `/build` slash command (workflow_dispatch trigger)
 channel-map.json                            # Source-of-truth Slack channel_id → "owner/repo" map; pushed to the bot's CHANNEL_MAP secret
@@ -37,7 +37,7 @@ Caller repos reference it like:
 uses: webavenue/build-agent/.github/workflows/capacitor-selfhosted.yml@main
 ```
 
-> **Org name:** the canonical slug is `webavenue/build-agent` (confirmed via `gh repo view --json nameWithOwner`; the org was renamed). The old `WebAvenueIG/...` slug still redirects — fine for git remotes and `uses:` references, but **API calls (e.g. `workflow_dispatch` from the Slack bot) must use the canonical `webavenue/...` form**, since POSTs don't reliably follow renamed-repo redirects.
+> **Org name:** the actual remote is `WebAvenueIG/build-agent` (matching `.secrets.env.example`). The `webavenue/...` slug used in examples here and in existing callers redirects to it on GitHub, so both forms work — prefer `WebAvenueIG/...` for new repos to avoid confusion.
 
 See [docs/self-hosted-setup.md](docs/self-hosted-setup.md) for runner install + the shared Fastfile mechanism.
 
@@ -66,8 +66,6 @@ import_from_git(
 
 **Project-specific overrides** (e.g. extra `before_all` setup) can go in the caller Fastfile after the `import_from_git` call.
 
-**Crashlytics dSYMs (iOS):** `ship_auto` ends with a self-detecting Crashlytics dSYM upload — when the caller has the FirebaseCrashlytics pod (`ios/App/Pods/FirebaseCrashlytics/upload-symbols`) and `ios/App/App/GoogleService-Info.plist`, gym's dSYM zip is pushed via `upload_symbols_to_crashlytics`. No extra secrets (auth comes from the plist). Projects without Crashlytics skip silently; upload errors are warn-only and never fail the build (it runs after the TestFlight upload). This is separate from App Store Connect symbolication, which already works via the default `uploadSymbols` export option.
-
 **Future Unity:** Unity lanes will live in `fastlane/unity/Fastfile` (separate path, separate import) when set up. No interference with Capacitor lanes.
 
 ### Workflow inputs
@@ -80,7 +78,7 @@ import_from_git(
 | `do_slack` | `true` | Send the Slack build notification |
 | `version_name` | `"1.0.0"` | Semantic version string |
 | `release_notes` | `"Bug fixes..."` | Fallback notes when `auto_changelog` is off or auto-generation finds nothing |
-| `auto_changelog` | `true` | Auto-generate release notes from commits since the last build tag via Claude; falls back to `release_notes` |
+| `auto_changelog` | `true` | Auto-generate release notes from commits since the last build tag via Codex; falls back to `release_notes` |
 | `version_code_offset` | `100` | Added to `github.run_number` to compute build code (fallback only — auto-versioning from the stores is the default) |
 
 > **Note:** iOS job only runs on `action: "build + upload"` — there is no build-only option for iOS.
@@ -134,9 +132,8 @@ DRY_RUN=1 ./scripts/push-secrets.sh --project my-app webavenue/my-app-repo
     - **iOS:** queries TestFlight for the max build number across all versions, +1. Env in: `IOS_BUNDLE_ID`, `APPLE_API_KEY_PATH`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `NEXT_BUILD_NUMBER_FILE`.
 
     If either lane is absent or fails, that platform's job silently falls back to `version_code_offset + run_number`. Resolved codes are exposed as `needs.android.outputs.version_code` and `needs.ios.outputs.version_code`, consumed by their respective Asana QA tasks, the Slack message (shows both when they diverge — `Version: 1.2.3 (Android 158 · iOS 42)`), and the `build-<N>` release tag (prefers Android, falls back to iOS).
-- **Play's "missing native debug symbols" warning is unactionable for Capacitor ad games.** Investigated for Dot Collector (June 2026): `debugSymbolLevel 'FULL'` + pinned `ndkVersion` are set, the NDK is on the runner, and `extractReleaseNativeDebugMetadata` runs — but it extracts 0 files because every `.so` in the app is a pre-stripped vendor binary (Pangle, AppLovin crash reporter, DataStore, zstd-jni). There's no first-party native code, so no symbols exist to bundle. The Android job's "Verify native debug symbols in AAB" step prints this diagnosis per build. Java/ANR stacks stay readable (minify off); vendor-native frames can only be symbolicated by the vendor.
 - **Notifications:** After both Android and iOS jobs finish, a notify job creates Asana QA tasks and posts a Slack message with build status, download links, and release notes. Notify runs on ubuntu-latest (no benefit to self-hosting it, and it frees the Mac mini for build jobs).
-- **Failure diagnosis:** On Android or iOS failure, the notify job pulls the failed-step logs via `gh run view --log-failed`, asks Claude Haiku 4.5 for a 2–4 sentence plain-English diagnosis, and posts it as a threaded reply to the Slack failure message. Requires `ANTHROPIC_API_KEY` on the caller repo; silently skipped if absent. Needs `actions: read` permission on the notify job (already declared).
+- **Failure diagnosis:** On Android or iOS failure, the notify job pulls the failed-step logs via `gh run view --log-failed`, asks Codex Haiku 4.5 for a 2–4 sentence plain-English diagnosis, and posts it as a threaded reply to the Slack failure message. Requires `ANTHROPIC_API_KEY` on the caller repo; silently skipped if absent. Needs `actions: read` permission on the notify job (already declared).
 
 ## Notify workflows (`notify.yml` / `external-notify.yml`)
 
@@ -159,9 +156,9 @@ A single Cloudflare Worker (`build-agent-slack-bot`) backing two slash commands.
 - **Worker config (`wrangler.toml`):** `WORKFLOW_FILE=build.yml`, `DEFAULT_REF=develop` — so the dispatched workflow must exist on `develop` (or pass a branch as the 3rd arg). Secrets set via `wrangler secret put`: `SLACK_SIGNING_SECRET`, `GITHUB_TOKEN`, `CHANNEL_MAP`.
 - **Deploy / debug:** `npm run deploy` (wrangler deploy), `npm run tail` for live logs. Healthcheck `GET /healthz`. All requests are HMAC-verified against `SLACK_SIGNING_SECRET` with 5-minute replay protection.
 
-## Automated PR review (claude-review.yml)
+## Automated PR review (Codex-review.yml)
 
-Reusable workflow that runs `anthropics/claude-code-action@v1` on a PR with a checklist tuned to the project stack. Designed to be the first reviewer on AI-generated game code — it catches the failure modes humans skim past (invented APIs, stale-closure bugs, missing Capacitor permissions, Unity null-check traps).
+Reusable workflow that runs `anthropics/Codex-action@v1` on a PR with a checklist tuned to the project stack. Designed to be the first reviewer on AI-generated game code — it catches the failure modes humans skim past (invented APIs, stale-closure bugs, missing Capacitor permissions, Unity null-check traps).
 
 Supports two trigger modes — caller picks one. The reusable workflow handles both `pull_request` and `issue_comment` events; the gate resolves PR context (head ref, draft state, file count) on either path.
 
@@ -185,7 +182,7 @@ permissions:
 
 jobs:
   review:
-    uses: webavenue/build-agent/.github/workflows/claude-review.yml@main
+    uses: webavenue/build-agent/.github/workflows/Codex-review.yml@main
     with:
       project_type: capacitor   # or "unity"
     secrets: inherit
@@ -212,10 +209,10 @@ jobs:
     if: >
       github.event.issue.pull_request != null &&
       startsWith(github.event.comment.body, '/review')
-    uses: webavenue/build-agent/.github/workflows/claude-review.yml@main
+    uses: webavenue/build-agent/.github/workflows/Codex-review.yml@main
     with:
       project_type: unity
-      model: claude-haiku-4-5   # default; reviewer can override per-call
+      model: Codex-haiku-4-5   # default; reviewer can override per-call
     secrets: inherit
 ```
 
@@ -228,18 +225,18 @@ The `if:` filters out comments on issues (vs PRs) and comments that don't start 
 Examples:
 ```
 /review                                      → caller's default model
-/review opus                                 → claude-opus-4-7  (deepest, ~25x haiku)
-/review sonnet                               → claude-sonnet-4-6
-/review haiku                                → claude-haiku-4-5
+/review opus                                 → Codex-opus-4-7  (deepest, ~25x haiku)
+/review sonnet                               → Codex-sonnet-4-6
+/review haiku                                → Codex-haiku-4-5
 /review focus on the spawner                 → default model + focus hint
 /review opus focus on the spawner            → model override + focus hint
 /review gdd:https://docs.google.com/document/d/<id>/edit
 /review opus gdd:https://docs.google.com/document/d/<id>/edit focus on combat
 ```
 
-Tokens are positional and case-insensitive for the model keyword. `gdd:<url>` must be a single whitespace-bounded token; Google Docs URLs have no spaces so this works. URLs wrapped in `<>` by GitHub's autolinker are also accepted. Anything after the optional `gdd:` token becomes a "Reviewer asked: …" line appended to the prompt so Claude knows where to focus. A reviewer using the word "opusified" in their notes won't false-trigger the Opus model — matching is whole-token only.
+Tokens are positional and case-insensitive for the model keyword. `gdd:<url>` must be a single whitespace-bounded token; Google Docs URLs have no spaces so this works. URLs wrapped in `<>` by GitHub's autolinker are also accepted. Anything after the optional `gdd:` token becomes a "Reviewer asked: …" line appended to the prompt so Codex knows where to focus. A reviewer using the word "opusified" in their notes won't false-trigger the Opus model — matching is whole-token only.
 
-### Tool permissions inside Claude (not GHA permissions)
+### Tool permissions inside Codex (not GHA permissions)
 
 The action's default permission mode prompts for each tool use — and since CI has no human to approve, every tool call is denied. The reusable workflow already passes the necessary allowlist via `--allowed-tools` in `claude_args`. If you're customizing the action elsewhere, the minimum set for PR reviews is:
 
@@ -247,13 +244,13 @@ The action's default permission mode prompts for each tool use — and since CI 
 Read,Glob,Grep,LS,Bash,mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment
 ```
 
-The two `mcp__github_*` tools are how the action surfaces comments to the PR — without them allowlisted, Claude can analyze the code but has no way to post findings.
+The two `mcp__github_*` tools are how the action surfaces comments to the PR — without them allowlisted, Codex can analyze the code but has no way to post findings.
 
 ### Inputs
 | Input | Default | Description |
 |---|---|---|
 | `project_type` | _required_ | `"capacitor"` or `"unity"` — selects the review checklist |
-| `model` | `claude-haiku-4-5` | Default model. Reviewers can override per-comment with `/review opus\|sonnet\|haiku ...`. |
+| `model` | `Codex-haiku-4-5` | Default model. Reviewers can override per-comment with `/review opus\|sonnet\|haiku ...`. |
 | `max_changed_files` | `80` | Skip review when the PR touches more files than this (cost guard). `0` disables. |
 | `skip_drafts` | `true` | Don't review draft PRs. |
 | `extra_instructions` | `""` | Extra prompt text appended to the checklist (e.g. "Pay extra attention to the new payments flow."). |
@@ -263,7 +260,7 @@ The two `mcp__github_*` tools are how the action surfaces comments to the PR —
 - **Capacitor:** React/Vite footguns (stale useEffect deps, conditional hooks, missing keys), Capacitor lifecycle/permission issues, mobile WebView quirks (touch vs mouse, safe areas, Android back button), game-loop leaks (rAF, audio, WebGL), and AI hallucinations (invented plugins/APIs).
 - **Unity:** Unity `Object` null pitfalls (`?.` lies about destroyed objects), coroutine/lifecycle leaks, hot-path allocations (LINQ in Update, boxing, GetComponent), event subscription leaks, mobile input/perf settings, and AI hallucinations (deprecated/nonexistent APIs).
 
-Both checklists explicitly tell Claude **not** to comment on style, naming, or "nice to haves" — only `[BUG]`, `[SECURITY]`, `[PERF]`, `[CRASH-RISK]`, or `[LOGIC]` issues earn inline comments. Everything else goes into a single sticky summary comment.
+Both checklists explicitly tell Codex **not** to comment on style, naming, or "nice to haves" — only `[BUG]`, `[SECURITY]`, `[PERF]`, `[CRASH-RISK]`, or `[LOGIC]` issues earn inline comments. Everything else goes into a single sticky summary comment.
 
 ### GDD validation (optional, per-comment)
 
@@ -280,7 +277,7 @@ When present, the workflow:
 3. Prepends the GDD to the review prompt under a clearly labeled section and adds a `[GDD-DRIFT]` severity tag to the inline-comment allowlist.
 4. Soft-fails on any fetch error (404, 403, malformed URL) — the review continues without GDD context and the failure reason is reported in the sticky summary.
 
-**`[GDD-DRIFT]` is advisory, not blocking.** The prompt explicitly tells Claude that GDDs often lag implementation: if a deviation is found, Claude asks whether the GDD or the code should change — it doesn't claim the PR is wrong.
+**`[GDD-DRIFT]` is advisory, not blocking.** The prompt explicitly tells Codex that GDDs often lag implementation: if a deviation is found, Codex asks whether the GDD or the code should change — it doesn't claim the PR is wrong.
 
 **Doc size.** GDDs are truncated at 200KB (≈50 pages, ≈25K tokens). For a giant master GDD, point at a feature-specific sub-doc instead — the per-PR URL design assumes the reviewer picks the relevant doc.
 

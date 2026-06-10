@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Pause or resume the ACTIVE phased release of the latest App Store version.
+# Usage: ios_phased_pause <ios-bundle-id> <PAUSED|ACTIVE> [--dry-run]
+#   PAUSED = pause the phased rollout; ACTIVE = resume it.
+# NOTE: completing a phased release early (jump to 100%) is deliberately NOT supported.
+# Env: AGENT_ASC_KEY (p8), AGENT_ASC_KEY_ID, AGENT_ASC_ISSUER_ID
+set -euo pipefail
+BUNDLE="${1:?usage: ios_phased_pause <ios-bundle-id> <PAUSED|ACTIVE> [--dry-run]}"
+STATE="${2:?target state required: PAUSED or ACTIVE}"
+DRY="${3:-}"
+
+case "$STATE" in
+  PAUSED|ACTIVE) ;;
+  COMPLETE|*100*) echo "REFUSED: completing a phased release early is not allowed via this agent." >&2; exit 3 ;;
+  *) echo "invalid state '$STATE' — must be PAUSED or ACTIVE" >&2; exit 1 ;;
+esac
+
+export ASC_P8="${AGENT_ASC_KEY:-$HOME/Documents/Sensitive/Apple_AuthKey_383Q6C4L74.p8}"
+export ASC_KID="${AGENT_ASC_KEY_ID:-383Q6C4L74}"
+export ASC_ISS="${AGENT_ASC_ISSUER_ID:-69a6de8a-0e5a-47e3-e053-5b8c7c11a4d1}"
+export ASC_BUNDLE="$BUNDLE" ASC_STATE="$STATE" ASC_DRY="$DRY"
+
+[ -f "$ASC_P8" ] || { echo "ios_phased_pause: write credential not available — not authorized for rollout actions" >&2; exit 2; }
+
+RUBY=/opt/homebrew/opt/ruby/bin/ruby
+[ -x "$RUBY" ] || RUBY="$(command -v ruby)"
+
+exec "$RUBY" <<'RB'
+require 'jwt'; require 'net/http'; require 'uri'; require 'json'; require 'openssl'
+
+pk  = OpenSSL::PKey::EC.new(File.read(ENV['ASC_P8']))
+now = Time.now.to_i
+tok = JWT.encode({iss: ENV['ASC_ISS'], iat: now, exp: now + 1200, aud: 'appstoreconnect-v1'},
+                 pk, 'ES256', {kid: ENV['ASC_KID'], typ: 'JWT'})
+
+def req(method, path, tok, body = nil)
+  u = URI("https://api.appstoreconnect.apple.com#{path}")
+  http = Net::HTTP.new(u.host, 443); http.use_ssl = true
+  r = http.send_request(method, u.request_uri, body && JSON.dump(body),
+        {'Authorization' => "Bearer #{tok}", 'Content-Type' => 'application/json'})
+  abort "ASC HTTP #{r.code}: #{r.body.to_s[0, 300]}" unless r.code.start_with?('2')
+  r.body.to_s.empty? ? {} : JSON.parse(r.body)
+end
+
+bundle, state, dry = ENV['ASC_BUNDLE'], ENV['ASC_STATE'], ENV['ASC_DRY'] == '--dry-run'
+
+app = req('GET', "/v1/apps?filter[bundleId]=#{bundle}", tok)['data'][0] or abort "no app for bundle #{bundle}"
+ver = req('GET', "/v1/apps/#{app['id']}/appStoreVersions?limit=1&fields[appStoreVersions]=versionString,appStoreState", tok)['data'][0] or abort 'no app store versions'
+pr  = req('GET', "/v1/appStoreVersions/#{ver['id']}/appStoreVersionPhasedRelease", tok)['data'] or abort "version #{ver['attributes']['versionString']} has no phased release"
+
+cur = pr['attributes']['phasedReleaseState']
+abort "phased release is #{cur} — only ACTIVE/PAUSED releases can be toggled" unless %w[ACTIVE PAUSED].include?(cur)
+desc = "#{app['attributes']['name']} #{ver['attributes']['versionString']}: phased release #{cur} -> #{state}"
+
+if dry
+  puts "DRY-RUN OK (no change sent): #{desc}"
+else
+  req('PATCH', "/v1/appStoreVersionPhasedReleases/#{pr['id']}", tok,
+      {data: {type: 'appStoreVersionPhasedReleases', id: pr['id'],
+              attributes: {phasedReleaseState: state}}})
+  puts "DONE: #{desc}"
+end
+RB

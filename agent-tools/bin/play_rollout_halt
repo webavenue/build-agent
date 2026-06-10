@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# HALT the in-progress staged rollout on the Google Play PRODUCTION track.
+# Usage: play_rollout_halt <android-package> [--dry-run]
+# Resume later with: play_rollout_update <package> <percent>
+# Env: AGENT_PLAY_KEY (publisher service-account JSON; default ~/Documents/Sensitive/google-play-key.json)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PKG="${1:?usage: play_rollout_halt <android-package> [--dry-run]}"
+DRY="${2:-}"
+KEY="${AGENT_PLAY_KEY:-$HOME/Documents/Sensitive/google-play-key.json}"
+
+[ -f "$KEY" ] || { echo "play_rollout_halt: write credential not available — not authorized for rollout actions" >&2; exit 2; }
+
+TOKEN="$("$HERE/lib/gtoken.sh" "$KEY" https://www.googleapis.com/auth/androidpublisher)"
+
+TOKEN="$TOKEN" PKG="$PKG" DRY="$DRY" python3 <<'PY'
+import json, os, sys, urllib.request, urllib.error
+
+tok, pkg, dry = os.environ["TOKEN"], os.environ["PKG"], os.environ["DRY"] == "--dry-run"
+base = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}"
+H = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
+
+def call(method, url, data=None):
+    req = urllib.request.Request(url, data=(json.dumps(data).encode() if data else None), headers=H, method=method)
+    try:
+        body = urllib.request.urlopen(req).read().decode()
+        return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code} {method} {url}\n{e.read().decode()[:500]}")
+
+eid = call("POST", base + "/edits")["id"]
+committed = False
+try:
+    track = call("GET", f"{base}/edits/{eid}/tracks/production")
+    releases = track.get("releases", [])
+    target = next((r for r in releases if r.get("status") == "inProgress"), None)
+    if target is None:
+        states = [(r.get("name"), r.get("status")) for r in releases]
+        sys.exit(f"no inProgress staged release on production to halt — releases: {states}")
+
+    frac = target.get("userFraction")
+    target["status"] = "halted"
+
+    call("PUT", f"{base}/edits/{eid}/tracks/production", {"track": "production", "releases": releases})
+    call("POST", f"{base}/edits/{eid}:validate")
+
+    desc = (f"{pkg} production release {target.get('name')!r} "
+            f"(versionCodes={','.join(target.get('versionCodes', []))}): "
+            f"inProgress {('%g%%' % (frac*100)) if frac else '?'} -> HALTED")
+    if dry:
+        print("DRY-RUN OK (edit validated, NOT committed): " + desc)
+    else:
+        call("POST", f"{base}/edits/{eid}:commit")
+        committed = True
+        print("DONE: " + desc)
+finally:
+    if not committed:
+        call("DELETE", f"{base}/edits/{eid}")
+PY

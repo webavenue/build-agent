@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# GA4 engagement/revenue by appVersion via the GA4 Data API (service-account auth).
+# Usage: ga_health <ga4-property-id> [days=28] [top_n=10]
+# Env: AGENT_GA_KEY (SA JSON added as Viewer on the GA property;
+#                    default = AGENT_PLAY_REPORTING_KEY = ~/Documents/Sensitive/google-play-reporting-api.json)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PROP="${1:?usage: ga_health <ga4-property-id> [days] [top_n]}"
+DAYS="${2:-28}"
+TOP="${3:-10}"
+KEY="${AGENT_GA_KEY:-${AGENT_PLAY_REPORTING_KEY:-$HOME/Documents/Sensitive/google-play-reporting-api.json}}"
+
+TOKEN="$("$HERE/lib/gtoken.sh" "$KEY" https://www.googleapis.com/auth/analytics.readonly)"
+
+TOKEN="$TOKEN" PROP="$PROP" DAYS="$DAYS" TOP="$TOP" python3 <<'PY'
+import json, os, sys, urllib.request, urllib.error
+
+tok, prop = os.environ["TOKEN"], os.environ["PROP"]
+days, top = int(os.environ["DAYS"]), int(os.environ["TOP"])
+
+body = json.dumps({
+    "dateRanges": [{"startDate": f"{days}daysAgo", "endDate": "yesterday"}],
+    "dimensions": [{"name": "appVersion"}],
+    "metrics": [{"name": m} for m in
+                ["activeUsers", "newUsers", "userEngagementDuration",
+                 "totalRevenue", "totalAdRevenue"]],
+    "orderBys": [{"metric": {"metricName": "activeUsers"}, "desc": True}],
+    "limit": top,
+}).encode()
+
+req = urllib.request.Request(
+    f"https://analyticsdata.googleapis.com/v1beta/properties/{prop}:runReport",
+    data=body, headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+try:
+    d = json.load(urllib.request.urlopen(req))
+except urllib.error.HTTPError as e:
+    msg = e.read().decode()[:400]
+    if e.code == 403:
+        sys.exit("HTTP 403 — the service account is not a Viewer on this GA property.\n"
+                 "Fix: GA Admin > Property Access Management > add the SA client_email as Viewer.\n" + msg)
+    sys.exit(f"HTTP {e.code}\n{msg}")
+
+rows = d.get("rows", [])
+if not rows:
+    sys.exit(f"property {prop}: no rows returned")
+print(f"GA4 property {prop} — last {days}d by appVersion")
+print(f"{'appVersion':>12}{'users':>9}{'new':>8}{'engSec/u':>10}{'rev$':>10}{'adRev$':>10}")
+for r in rows:
+    ver = r["dimensionValues"][0]["value"]
+    u, n, eng, rev, adrev = (float(m["value"]) for m in r["metricValues"])
+    print(f"{ver:>12}{int(u):>9}{int(n):>8}{(eng/u if u else 0):>10.0f}{rev:>10.2f}{adrev:>10.2f}")
+PY

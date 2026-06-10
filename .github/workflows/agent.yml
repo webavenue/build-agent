@@ -1,0 +1,177 @@
+# ─────────────────────────────────────────────────────────────
+# @Neo rollout & app-health agent.
+#
+# Dispatched by the Slack worker (slack-bot/) when someone mentions
+# @Neo in a mapped channel. Runs Codex headless on the Mac mini
+# against the agent-tools/ toolkit and posts the answer back to the
+# Slack thread.
+#
+# Centralized by design: this workflow runs HERE (webavenue/build-agent),
+# never in the game repos — the `project` input selects the game via
+# agent-tools/projects/<project>.env. Zero per-game secrets.
+#
+# Authorization (defense in depth — the LLM is never the boundary):
+#   1. The worker computes can_rollout from its ROLLOUT_ALLOWLIST secret.
+#   2. This workflow re-checks the Slack user against the repo variable
+#      ROLLOUT_ALLOWED_SLACK_IDS (comma-separated). Both must agree.
+#   3. Write credentials (Play publisher key, ASC .p8) are only written
+#      to disk when authorized — without them the mutating scripts in
+#      agent-tools/bin fail closed, no matter what the model does.
+#
+# Required secrets (this repo): GOOGLE_PLAY_REPORTING_KEY_BASE64,
+#   GOOGLE_PLAY_JSON_KEY_BASE64, APPLE_API_KEY_BASE64, APPLE_API_KEY_ID,
+#   APPLE_API_ISSUER_ID, SLACK_BOT_TOKEN
+# Required variables: ROLLOUT_ALLOWED_SLACK_IDS
+# Host prerequisites (agent runner): codex CLI (logged in), gcloud
+#   (user logged in, for bq/Crashlytics), bq, python3, Homebrew ruby
+#   with the jwt gem. See docs/self-hosted-setup.md.
+# ─────────────────────────────────────────────────────────────
+name: Rollout & Health Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Game config name (agent-tools/projects/<project>.env)"
+        required: true
+        type: string
+      question:
+        description: "The user's question / request"
+        required: true
+        type: string
+      slack_user_id:
+        description: "Slack user ID of the requester"
+        required: true
+        type: string
+      slack_channel_id:
+        description: "Slack channel to reply in"
+        required: true
+        type: string
+      slack_thread_ts:
+        description: "Slack thread timestamp to reply under"
+        required: true
+        type: string
+      can_rollout:
+        description: "Worker-side allowlist verdict (re-checked here)"
+        required: false
+        type: string
+        default: "false"
+
+run-name: "agent: ${{ inputs.project }} (${{ inputs.slack_user_id }})"
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    runs-on: [self-hosted, macOS, ARM64, agent]
+    timeout-minutes: 15
+    env:
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate project
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          if ! [[ "$PROJECT" =~ ^[a-z0-9-]+$ ]] || [ ! -f "agent-tools/projects/$PROJECT.env" ]; then
+            echo "unknown project: $PROJECT" >&2
+            exit 1
+          fi
+
+      - name: Re-verify rollout authorization
+        id: auth
+        env:
+          ALLOWLIST: ${{ vars.ROLLOUT_ALLOWED_SLACK_IDS }}
+          WORKER_VERDICT: ${{ inputs.can_rollout }}
+          REQUESTER: ${{ inputs.slack_user_id }}
+        run: |
+          can=false
+          if [ "$WORKER_VERDICT" = "true" ]; then
+            case ",${ALLOWLIST}," in
+              *",${REQUESTER},"*) can=true ;;
+            esac
+          fi
+          echo "can_rollout=$can" >> "$GITHUB_OUTPUT"
+          echo "rollout authorization: $can"
+
+      - name: Write credentials (write keys only when authorized)
+        env:
+          REPORTING_B64: ${{ secrets.GOOGLE_PLAY_REPORTING_KEY_BASE64 }}
+          PLAY_B64: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}
+          ASC_B64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          CAN_ROLLOUT: ${{ steps.auth.outputs.can_rollout }}
+        run: |
+          KEYDIR="$RUNNER_TEMP/agent-keys"
+          mkdir -p "$KEYDIR" && chmod 700 "$KEYDIR"
+          printf '%s' "$REPORTING_B64" | base64 -d > "$KEYDIR/play-reporting.json"
+          if [ "$CAN_ROLLOUT" = "true" ]; then
+            printf '%s' "$PLAY_B64" | base64 -d > "$KEYDIR/play-key.json"
+            printf '%s' "$ASC_B64"  | base64 -d > "$KEYDIR/asc.p8"
+          fi
+
+      - name: Run Codex agent
+        working-directory: agent-tools
+        env:
+          PROJECT: ${{ inputs.project }}
+          QUESTION: ${{ inputs.question }}
+          REQUESTER: ${{ inputs.slack_user_id }}
+          CAN_ROLLOUT: ${{ steps.auth.outputs.can_rollout }}
+          AGENT_PLAY_REPORTING_KEY: ${{ runner.temp }}/agent-keys/play-reporting.json
+          AGENT_GA_KEY: ${{ runner.temp }}/agent-keys/play-reporting.json
+          AGENT_PLAY_KEY: ${{ runner.temp }}/agent-keys/play-key.json
+          AGENT_ASC_KEY: ${{ runner.temp }}/agent-keys/asc.p8
+          AGENT_ASC_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          AGENT_ASC_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          if [ "$CAN_ROLLOUT" = "true" ]; then
+            AUTHNOTE="The requester IS authorized for rollout actions."
+          else
+            AUTHNOTE="The requester is NOT authorized for rollout actions (read-only)."
+          fi
+          PROMPT="Slack user ${REQUESTER} asks about project ${PROJECT}: ${QUESTION}
+
+${AUTHNOTE}
+Reply for Slack (concise, *bold* + bullets, no markdown tables/headers)."
+
+          codex exec \
+            --skip-git-repo-check \
+            --sandbox workspace-write \
+            -c sandbox_workspace_write.network_access=true \
+            -c "sandbox_workspace_write.writable_roots=[\"$HOME/.config/gcloud\",\"$HOME/.bigquery\",\"$HOME/.bigqueryrc\",\"$HOME/.cache\"]" \
+            --output-last-message "$RUNNER_TEMP/answer.md" \
+            "$PROMPT"
+
+      - name: Post answer to Slack thread
+        if: always()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          CHANNEL: ${{ inputs.slack_channel_id }}
+          THREAD_TS: ${{ inputs.slack_thread_ts }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          answer_path = os.path.join(os.environ["RUNNER_TEMP"], "answer.md")
+          try:
+              with open(answer_path) as f:
+                  text = f.read().strip()
+          except FileNotFoundError:
+              text = ""
+          if not text:
+              text = f":x: The agent failed before producing an answer. <{os.environ['RUN_URL']}|Workflow logs>"
+          body = json.dumps({
+              "channel": os.environ["CHANNEL"],
+              "thread_ts": os.environ["THREAD_TS"],
+              "text": text[:39000],
+              "unfurl_links": False,
+          }).encode()
+          req = urllib.request.Request(
+              "https://slack.com/api/chat.postMessage", data=body,
+              headers={"Authorization": "Bearer " + os.environ["SLACK_BOT_TOKEN"],
+                       "Content-Type": "application/json; charset=utf-8"})
+          resp = json.load(urllib.request.urlopen(req))
+          print("slack post ok:", resp.get("ok"), resp.get("error", ""))
+          PY

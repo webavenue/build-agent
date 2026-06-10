@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Update (or resume, if halted) the staged-rollout fraction of the Google Play PRODUCTION release.
+# Usage: play_rollout_update <android-package> <percent 1-99 | fraction 0.01-0.99> [--dry-run]
+# HARD RULE: maximum rollout is 99%. 100% is never allowed, no exceptions.
+# --dry-run builds and validates the edit, prints what would change, then discards it.
+# Env: AGENT_PLAY_KEY (publisher service-account JSON; default ~/Documents/Sensitive/google-play-key.json)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PKG="${1:?usage: play_rollout_update <android-package> <percent|fraction> [--dry-run]}"
+PCT="${2:?rollout percent (1-99) or fraction (0.01-0.99) required}"
+DRY="${3:-}"
+KEY="${AGENT_PLAY_KEY:-$HOME/Documents/Sensitive/google-play-key.json}"
+
+[ -f "$KEY" ] || { echo "play_rollout_update: write credential not available — not authorized for rollout actions" >&2; exit 2; }
+
+TOKEN="$("$HERE/lib/gtoken.sh" "$KEY" https://www.googleapis.com/auth/androidpublisher)"
+
+TOKEN="$TOKEN" PKG="$PKG" PCT="$PCT" DRY="$DRY" python3 <<'PY'
+import json, os, sys, urllib.request, urllib.error
+
+tok, pkg, dry = os.environ["TOKEN"], os.environ["PKG"], os.environ["DRY"] == "--dry-run"
+
+raw = float(os.environ["PCT"])
+frac = raw / 100.0 if raw > 1.0 else raw          # accept 76 or 0.76
+frac = round(frac, 4)
+if frac >= 0.995:
+    sys.exit(f"REFUSED: maximum rollout is 99 percent. Rolling out to 100 percent is not allowed "
+             f"via this agent, no exceptions. Requested: {raw:g}")
+if not (0.0 < frac <= 0.99):
+    sys.exit(f"invalid rollout fraction {frac} — must be between 0.01 and 0.99 (1%-99%)")
+
+base = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}"
+H = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
+
+def call(method, url, data=None):
+    req = urllib.request.Request(url, data=(json.dumps(data).encode() if data else None), headers=H, method=method)
+    try:
+        body = urllib.request.urlopen(req).read().decode()
+        return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code} {method} {url}\n{e.read().decode()[:500]}")
+
+eid = call("POST", base + "/edits")["id"]
+committed = False
+try:
+    track = call("GET", f"{base}/edits/{eid}/tracks/production")
+    releases = track.get("releases", [])
+    target = next((r for r in releases if r.get("status") in ("inProgress", "halted")), None)
+    if target is None:
+        states = [(r.get("name"), r.get("status")) for r in releases]
+        sys.exit(f"no staged (inProgress/halted) release on production to update — releases: {states}")
+
+    old_frac = target.get("userFraction")
+    old_status = target["status"]
+    target["userFraction"] = frac
+    target["status"] = "inProgress"   # resuming a halted release is the same operation
+
+    call("PUT", f"{base}/edits/{eid}/tracks/production", {"track": "production", "releases": releases})
+    call("POST", f"{base}/edits/{eid}:validate")
+
+    desc = (f"{pkg} production release {target.get('name')!r} "
+            f"(versionCodes={','.join(target.get('versionCodes', []))}): "
+            f"{old_status} {('%g%%' % (old_frac*100)) if old_frac else '?'} "
+            f"-> inProgress {frac*100:g}%")
+    if dry:
+        print("DRY-RUN OK (edit validated, NOT committed): " + desc)
+    else:
+        call("POST", f"{base}/edits/{eid}:commit")
+        committed = True
+        print("DONE: " + desc)
+finally:
+    if not committed:
+        call("DELETE", f"{base}/edits/{eid}")
+PY

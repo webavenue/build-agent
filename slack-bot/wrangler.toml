@@ -1,17 +1,23 @@
-# Cloudflare Worker config for the Slack slash-command bot
-# (/build and /invite-to-repo).
+# Cloudflare Worker config for the Slack bot
+# (/build, /invite-to-repo, and @Neo rollout/health mentions).
 #
 # Plain vars live here. Secrets are set via `wrangler secret put <NAME>`
 # (or in the Cloudflare dashboard) and never committed:
 #
 #   SLACK_SIGNING_SECRET   Slack app "Signing Secret" (Basic Information page)
-#   GITHUB_TOKEN           PAT or fine-grained token for every repo in CHANNEL_MAP.
-#                          /build needs `actions:write`. /invite-to-repo also needs
-#                          collaborator management: classic `repo` scope, or a
-#                          fine-grained PAT with Administration: read & write.
-#   CHANNEL_MAP            JSON map of Slack channel_id → "owner/repo", e.g.
-#                          {"C0123ABC":"webavenue/flight-manager",
-#                           "C0456DEF":"webavenue/golf-tycoon"}
+#   GITHUB_TOKEN           PAT or fine-grained token for every repo in CHANNEL_MAP
+#                          plus AGENT_REPO. /build and @mentions need `actions:write`.
+#                          /invite-to-repo also needs collaborator management:
+#                          classic `repo` scope, or a fine-grained PAT with
+#                          Administration: read & write.
+#   CHANNEL_MAP            JSON map of Slack channel_id → "owner/repo" string, or
+#                          {"repo":"owner/repo","project":"idle-flight-manager"}.
+#                          The `project` key enables the @Neo agent for the channel.
+#   ROLLOUT_ALLOWLIST      JSON array of Slack user IDs allowed to mutate rollouts,
+#                          e.g. ["U0123ABCDEF"]. Anyone else gets read-only health
+#                          answers. Missing/malformed ⇒ nobody can mutate.
+#   SLACK_BOT_TOKEN        xoxb- bot token; used for the 👀 ack reaction and error
+#                          replies on @mentions. Optional but recommended.
 
 name = "build-agent-slack-bot"
 main = "src/index.ts"
@@ -22,6 +28,13 @@ WORKFLOW_FILE = "build.yml"
 # Default branch used when /build is invoked without a 3rd arg.
 # Override per-command with: /build android 1.2.3 main
 DEFAULT_REF = "develop"
+# @Neo mention agent: always dispatched centrally on build-agent (NOT the game
+# repos — zero per-game secrets). The project input selects the game.
+# NOTE: must be the CANONICAL repo slug (gh repo view --json nameWithOwner) —
+# the GitHub API does not reliably follow renamed-org redirects on POST.
+AGENT_REPO = "webavenue/build-agent"
+AGENT_WORKFLOW_FILE = "agent.yml"
+AGENT_REF = "main"
 
 [observability]
 enabled = true

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Top fatal Crashlytics issues from the BigQuery export.
+# Usage: crashlytics_top <firebase-project> <table-prefix> <ANDROID|IOS> [days=14] [top_n=10]
+#   table-prefix example: com_infinitygames_idletruckfleet
+# Auth: uses the bq CLI's logged-in gcloud account.
+set -euo pipefail
+PROJECT="${1:?usage: crashlytics_top <firebase-project> <table-prefix> <ANDROID|IOS> [days] [top_n]}"
+PREFIX="${2:?table prefix required (e.g. com_infinitygames_idletruckfleet)}"
+PLATFORM="${3:?platform required: ANDROID or IOS}"
+DAYS="${4:-14}"
+TOP="${5:-10}"
+
+TABLE="${PROJECT}.firebase_crashlytics.${PREFIX}_${PLATFORM}_REALTIME"
+
+bq --project_id="$PROJECT" query --use_legacy_sql=false --format=pretty --max_rows="$TOP" "
+SELECT
+  SUBSTR(ANY_VALUE(issue_title), 0, 48) AS issue,
+  MAX(application.display_version)      AS app_ver,
+  COUNT(*)                              AS events,
+  COUNT(DISTINCT installation_uuid)     AS users
+FROM \`$TABLE\`
+WHERE event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL $DAYS DAY)
+  AND error_type = 'FATAL'
+GROUP BY issue_id
+ORDER BY events DESC
+LIMIT $TOP" 2>&1 | grep -v '^Waiting' || {
+  echo "Query failed — most likely the Crashlytics BigQuery export is not enabled for $PROJECT." >&2
+  echo "Fix: Firebase console > Project settings > Integrations > BigQuery > link, enable Crashlytics." >&2
+  exit 1
+}
