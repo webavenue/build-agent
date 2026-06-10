@@ -128,6 +128,12 @@ jobs:
             echo ""
             echo "== App Store versions / phased release =="
             bin/ios_phased_status "$IOS_BUNDLE_ID" || echo "(App Store status unavailable)"
+            echo ""
+            echo "== Play ratings (recent commented reviews, by version) =="
+            bin/play_ratings "$ANDROID_PACKAGE_NAME" || echo "(Play ratings unavailable)"
+            echo ""
+            echo "== App Store ratings =="
+            bin/ios_ratings "$IOS_BUNDLE_ID" us || echo "(App Store ratings unavailable)"
           } > "$RUNNER_TEMP/store-status.txt" 2>&1 || true
           cat "$RUNNER_TEMP/store-status.txt"
 

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Recent Google Play review ratings, broken down by app version.
+# Usage: play_ratings <android-package> [max_reviews=100]
+# CAVEAT: the Reviews API only returns reviews WITH TEXT from roughly the last
+# week — star-only ratings are invisible here, and commented reviews skew
+# negative. Good for build-vs-build deltas, not for the store-listing average.
+# Env: AGENT_PLAY_KEY (publisher service-account JSON; default ~/Documents/Sensitive/google-play-key.json)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PKG="${1:?usage: play_ratings <android-package> [max_reviews]}"
+MAX="${2:-100}"
+KEY="${AGENT_PLAY_KEY:-$HOME/Documents/Sensitive/google-play-key.json}"
+
+[ -f "$KEY" ] || { echo "play_ratings: store credential not available in this run" >&2; exit 2; }
+
+TOKEN="$("$HERE/lib/gtoken.sh" "$KEY" https://www.googleapis.com/auth/androidpublisher)"
+
+TOKEN="$TOKEN" PKG="$PKG" MAX="$MAX" python3 <<'PY'
+import json, os, sys, urllib.request, urllib.error
+from collections import defaultdict
+
+tok, pkg, mx = os.environ["TOKEN"], os.environ["PKG"], int(os.environ["MAX"])
+url = (f"https://androidpublisher.googleapis.com/androidpublisher/v3/"
+       f"applications/{pkg}/reviews?maxResults={min(mx,100)}")
+req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+try:
+    d = json.load(urllib.request.urlopen(req))
+except urllib.error.HTTPError as e:
+    sys.exit(f"HTTP {e.code}: {e.read().decode()[:300]}")
+
+revs = d.get("reviews", [])
+if not revs:
+    sys.exit(f"{pkg}: no recent commented reviews returned")
+
+byver = defaultdict(list)
+allstars = []
+for r in revs:
+    uc = r["comments"][0]["userComment"]
+    vc = uc.get("appVersionCode")
+    vn = uc.get("appVersionName", "?")
+    label = f"{vn} (vc {vc})" if vc else "unknown version"
+    stars = uc["starRating"]
+    byver[(vc or 0, label)].append(stars)
+    allstars.append(stars)
+
+print(f"{pkg} — recent commented Play reviews (text-only sample, ~last 7 days):")
+print(f"  overall: avg {sum(allstars)/len(allstars):.2f} stars from {len(allstars)} reviews")
+for (vc, label), stars in sorted(byver.items(), reverse=True):
+    print(f"  {label}: avg {sum(stars)/len(stars):.2f} from {len(stars)} review(s)")
+print("  note: star-only ratings not included; commented reviews skew negative.")
+PY

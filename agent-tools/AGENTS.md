@@ -27,6 +27,8 @@ source ./projects/$PROJECT.env
 | iOS App Store versions + phased release | `bin/ios_phased_status $IOS_BUNDLE_ID` | phased release auto-ramps over 7 days; `READY_FOR_SALE` = live |
 | Crash details / new top issues (Android & iOS) | **Crashlytics MCP tools** (preferred): `crashlytics_get_report` with `report: "topIssues"`, `appId: $FIREBASE_ANDROID_APP_ID` or `$FIREBASE_IOS_APP_ID`, filter `issueErrorTypes: ["FATAL"]` (or `["ANR"]` on Android). Drill down with `crashlytics_get_issue` / `crashlytics_list_events`. | Same data the Firebase console shows, up to 90 days. Fallback: `bin/crashlytics_top $FIREBASE_PROJECT $CRASHLYTICS_TABLE_PREFIX ANDROID\|IOS [days]` (BigQuery export — only on projects with the export enabled) |
 | Users / engagement / revenue / ad revenue by appVersion | `bin/ga_health $GA_PROPERTY_ID [days]` | GA4; "yesterday" is the freshest complete day |
+| Play ratings by version (recent) | `bin/play_ratings $ANDROID_PACKAGE_NAME` | Commented reviews only (~last 7 days) — skews negative; valid for build-vs-build deltas, NOT comparable to the store-listing average |
+| App Store ratings | `bin/ios_ratings $IOS_BUNDLE_ID [countries]` | All-time average per storefront + recent-50-review trend. Apple has NO per-version ratings (cumulative only) — never claim an iOS build changed the rating; report trend instead |
 
 ## Critical rules
 
@@ -50,6 +52,7 @@ When asked for a health report (or before recommending a rollout increase):
 3. `bin/crashlytics_top ... ANDROID` and `... IOS` — new/top fatal issues (skip gracefully if export unavailable).
 4. `bin/ga_health` — latest vs previous appVersion, per-user normalized.
 5. `bin/ios_phased_status` — iOS version + phased state.
+6. `bin/play_ratings` + `bin/ios_ratings` — user sentiment: Android build-vs-build review average, iOS all-time + recent trend.
 
 Summarize for Slack: short, plain English, lead with the verdict (healthy / watch / problem), then the numbers. Use Slack formatting (*bold*, bullet lines), not markdown headers or tables.
 
