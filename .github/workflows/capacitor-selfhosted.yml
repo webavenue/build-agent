@@ -1050,7 +1050,6 @@ jobs:
                 assignee: $assignee,
                 due_on: $due_on,
                 custom_fields: {
-                  "1200038130204914": "1200603160957685",   # Department IG = QA
                   "1214780966676034": "1214780966676036",   # Type = Build
                   "1203895205998375": "1203895205998376",   # Platforms IG = Android
                   "1205371522841649": $version              # Version (text)
@@ -1123,7 +1122,6 @@ jobs:
                 assignee: $assignee,
                 due_on: $due_on,
                 custom_fields: {
-                  "1200038130204914": "1200603160957685",   # Department IG = QA
                   "1214780966676034": "1214780966676036",   # Type = Build
                   "1203895205998375": "1203895205998378",   # Platforms IG = iOS
                   "1205371522841649": $version              # Version (text)

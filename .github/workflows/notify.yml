@@ -249,7 +249,7 @@ jobs:
           NOTES=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
           DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
           VERSION_FIELD="${VERSION_FULL} (${VERSION_CODE})"   # Asana "Version" text field
-          # custom_fields GIDs → Department IG=QA, Type=Build, Platforms IG=Android, Version(text)
+          # custom_fields GIDs → Type=Build, Platforms IG=Android, Version(text)
           PAYLOAD=$(jq -n \
             --arg name "$TASK_NAME" \
             --arg notes "$NOTES" \
@@ -257,7 +257,7 @@ jobs:
             --arg assignee "$ASANA_ASSIGNEE_ID" \
             --arg due_on "$DUE_ON" \
             --arg version "$VERSION_FIELD" \
-            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee, due_on: $due_on, custom_fields: {"1200038130204914": "1200603160957685", "1214780966676034": "1214780966676036", "1203895205998375": "1203895205998376", "1205371522841649": $version}}}')
+            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee, due_on: $due_on, custom_fields: {"1214780966676034": "1214780966676036", "1203895205998375": "1203895205998376", "1205371522841649": $version}}}')
 
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
@@ -311,7 +311,7 @@ jobs:
           NOTES=$(printf 'Branch: %s\n\nRelease Notes:\n%s' "$BRANCH" "$RELEASE_NOTES")
           DUE_ON=$(date +%F)   # today's date (runner UTC), YYYY-MM-DD — sets Asana due date
           VERSION_FIELD="${VERSION_FULL} (${VERSION_CODE})"   # Asana "Version" text field
-          # custom_fields GIDs → Department IG=QA, Type=Build, Platforms IG=iOS, Version(text)
+          # custom_fields GIDs → Type=Build, Platforms IG=iOS, Version(text)
           PAYLOAD=$(jq -n \
             --arg name "$TASK_NAME" \
             --arg notes "$NOTES" \
@@ -319,7 +319,7 @@ jobs:
             --arg assignee "$ASANA_ASSIGNEE_ID" \
             --arg due_on "$DUE_ON" \
             --arg version "$VERSION_FIELD" \
-            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee, due_on: $due_on, custom_fields: {"1200038130204914": "1200603160957685", "1214780966676034": "1214780966676036", "1203895205998375": "1203895205998378", "1205371522841649": $version}}}')
+            '{data: {name: $name, notes: $notes, projects: $projects, assignee: $assignee, due_on: $due_on, custom_fields: {"1214780966676034": "1214780966676036", "1203895205998375": "1203895205998378", "1205371522841649": $version}}}')
 
           TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
             -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
